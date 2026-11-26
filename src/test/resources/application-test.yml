@@ -1,0 +1,30 @@
+server:
+  # Open MCP SSE streams would otherwise hold graceful shutdown for the full 30s phase timeout.
+  shutdown: immediate
+
+spring:
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:h2:mem:mcpguard_test;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;LOCK_TIMEOUT=10000;DB_CLOSE_DELAY=-1}
+    driver-class-name: ${SPRING_DATASOURCE_DRIVER_CLASS_NAME:org.h2.Driver}
+    username: ${SPRING_DATASOURCE_USERNAME:sa}
+    password: ${SPRING_DATASOURCE_PASSWORD:}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+
+guardrail:
+  mandate:
+    currency: USD
+    auto-approve-single-limit: 50.00
+    rolling-24h-order-limit: 200.00
+    approval-ttl-hours: 24
+  security:
+    agent-api-key: test-agent-key
+    reviewer-api-key: test-reviewer-key
+    snapshot-hmac-key: test-snapshot-hmac
+  recovery:
+    stale-after-minutes: 15
+    sweep-interval-ms: 3600000
+  demo:
+    seed-enabled: true
+    http-enabled: true

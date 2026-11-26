@@ -1,0 +1,64 @@
+name: CI - Zero Token Mock Suite
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ['17', '21']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ matrix.java }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: maven
+
+      - name: Run deterministic verification suite on H2 (0 external LLM API credits)
+        run: chmod +x mvnw && ./mvnw -B clean verify
+
+  verify-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: mcpguard
+          POSTGRES_USER: mcpguard
+          POSTGRES_PASSWORD: mcpguard_local
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mcpguard -d mcpguard"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Run the suite against PostgreSQL 16 (migrations and row locks)
+        run: chmod +x mvnw && ./mvnw -B clean verify
+        env:
+          SPRING_DATASOURCE_URL: jdbc:postgresql://localhost:5432/mcpguard
+          SPRING_DATASOURCE_DRIVER_CLASS_NAME: org.postgresql.Driver
+          SPRING_DATASOURCE_USERNAME: mcpguard
+          SPRING_DATASOURCE_PASSWORD: mcpguard_local
+          SPRING_DATASOURCE_HIKARI_CONNECTION_INIT_SQL: SET lock_timeout = '10s'

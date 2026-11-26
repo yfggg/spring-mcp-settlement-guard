@@ -1,0 +1,70 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: spring-mcp-settlement-guard
+  datasource:
+    url: jdbc:h2:mem:mcpguard;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;LOCK_TIMEOUT=10000;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  jpa:
+    open-in-view: false
+    hibernate:
+      # Flyway owns the schema; Hibernate only checks that the entity mappings match it.
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  ai:
+    mcp:
+      server:
+        enabled: true
+        name: spring-mcp-settlement-guard
+        version: 0.1.0
+        type: SYNC
+        sse-endpoint: /sse
+        sse-message-endpoint: /mcp/message
+
+guardrail:
+  mandate:
+    currency: USD
+    auto-approve-single-limit: 50.00
+    rolling-24h-order-limit: 200.00
+    approval-ttl-hours: 24
+  security:
+    agent-api-key: ${MCP_AGENT_API_KEY:mcp-demo-agent-key-2026}
+    reviewer-api-key: ${MCP_REVIEWER_API_KEY:mcp-demo-reviewer-key-2026}
+    snapshot-hmac-key: ${MCP_SNAPSHOT_HMAC_KEY:mcp-demo-snapshot-hmac-2026}
+  recovery:
+    stale-after-minutes: 15
+    sweep-interval-ms: 60000
+  demo:
+    seed-enabled: true
+    http-enabled: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+
+---
+spring:
+  config:
+    activate:
+      on-profile: postgres
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/mcpguard}
+    driver-class-name: org.postgresql.Driver
+    username: ${SPRING_DATASOURCE_USERNAME:mcpguard}
+    password: ${SPRING_DATASOURCE_PASSWORD:mcpguard_local}
+guardrail:
+  demo:
+    seed-enabled: false
+    http-enabled: false
