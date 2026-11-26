@@ -7,12 +7,14 @@ import java.math.BigDecimal;
 import java.util.List;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
+import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
 
 /**
  * Seeds deterministic sample invoices on startup for quick-start verification.
  */
 @Component
+@Order(10)
 public class DemoDataInitializer implements ApplicationRunner {
 
     public static final String DEMO_BATCH_ID = "BATCH-2026-11";

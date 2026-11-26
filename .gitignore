@@ -26,3 +26,9 @@ target/
 Thumbs.db
 logs/
 *.log
+
+### Local Secrets ###
+sk_test.txt
+sk_*.txt
+.env
+.env.*

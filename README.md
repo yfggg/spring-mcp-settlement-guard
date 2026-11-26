@@ -75,7 +75,7 @@ sequenceDiagram
 
 | Failure Mode in Naive Agents | How `spring-mcp-settlement-guard` Solves It |
 | :--- | :--- |
-| **Duplicate mutations on timeout/retry** | Stripe-style 3-state `IdempotencyKeyStore` (`IN_PROGRESS` / `COMPLETED` / `UNKNOWN_SUSPENDED`) backed by a DB unique constraint in an isolated transaction before side effects run. The fingerprint covers every business field, so reusing a key with any changed field is a `409`. If an agent retries under a *new* key while an identical refund (same order, amount, currency, reason) is still pending, executing, or frozen, the request is linked to the existing one instead of reserving and paying again; the link is stored with the evaluation, so it survives crashes. Once money has moved, the caller always gets the settled result, even if storing the receipt fails. |
+| **Duplicate mutations on timeout/retry** | Stripe-style 3-state `IdempotencyKeyStore` (`IN_PROGRESS` / `COMPLETED` / `UNKNOWN_SUSPENDED`) backed by a DB unique constraint in an isolated transaction before side effects run. The fingerprint covers every business field, so reusing a key with any changed field is a `409`. If the caller omits the key, the server uses that fingerprint as the one-time key, so the same order, amount, currency, and reason cannot pay twice. If an agent retries under a *new* key while an identical refund (same order, amount, currency, reason) is still pending, executing, or frozen, the request is linked to the existing one instead of reserving and paying again; the link is stored with the evaluation, so it survives crashes. Once money has moved, the caller always gets the settled result, even if storing the receipt fails. |
 | **Gateway timeout after money may have moved** | The payout is reserved as `EXECUTING` and committed *before* the gateway call, which runs outside any DB transaction. A timeout freezes the request as `PAYOUT_UNKNOWN`: it keeps counting against limits and cannot be approved again. |
 | **One person (or one stolen key) closing a frozen payout** | Resolving `PAYOUT_UNKNOWN` takes two reviewers: one proposes CONFIRM or RELEASE, a different one approves. Both steps look the refund up at the gateway by its idempotency key: CONFIRM needs a matching transaction id, amount, and currency; RELEASE needs the gateway to have no refund. A provider transaction id can settle only one refund (unique constraint). |
 | **Refunds for unknown orders or over-refunds** | Under the order row lock, the request is rejected unless the order exists and `amount <= captured - already refunded - reserved (pending / executing / unknown)`. Unknown order ids leave no rows behind. |
@@ -89,6 +89,21 @@ sequenceDiagram
 | **Schema drift** | Flyway owns the schema (`db/migration`); Hibernate runs with `ddl-auto: validate`. |
 | **LLM arithmetic errors** | Ledger matching and currency rounding run strictly in read-only Java `BigDecimal` domain services (`DeterministicReconciler`). |
 | **Expensive, flaky CI tests** | Full integration suite uses the official `McpSyncClient` over SSE + multi-threaded race harnesses + failure injection. JDK 17 and 21 run on H2; a separate job runs the same suite on PostgreSQL 16. No external LLM API keys. |
+
+## Where This Fits (Use Cases & Beyond Refunds)
+
+**Reference scenario modeled in this repository — e-commerce & SaaS post-sale refunds:**
+- **Batch settlement reconciliation (`reconcile_settlement_batch`):** Operations or finance agents compare expected invoice totals against gateway-captured amounts (duplicate captures, shipping overcharges, fee variances) in read-only `BigDecimal` code instead of letting an LLM do arithmetic in context.
+- **Tiered customer support refunds (`issue_customer_refund`):** Support agents settle routine micro-refunds automatically within remaining order balance and velocity caps (`<= $50.00` single, `<= $200.00` rolling 24h), while larger or split claims freeze as `PENDING_APPROVAL` for a finance reviewer—and gateway timeouts freeze as `PAYOUT_UNKNOWN` for two-reviewer reconciliation.
+
+**Why server-side holds instead of client-side MCP confirmation prompts:**
+Desktop MCP hosts can ask a user *"Allow this tool call?"* before sending a request, which gates whether a tool runs in that chat session. Financial controls need a different boundary: the person chatting with the agent is rarely an authorized finance approver, client UIs can be set to auto-approve, and real reviews happen minutes or hours later in Slack or an internal back office. Here the MCP tool reserves the allowance on the server, returns `PENDING_APPROVAL` immediately, and requires an authenticated backend sign-off before money moves.
+
+**Adapting the guardrail to other state-mutating workflows:**
+Swapping `PaymentGatewayPort` applies the same row-locked velocity check, idempotency store, HMAC snapshot, and outbox pattern to other high-risk agent actions:
+- **Accounts payable & contractor payouts:** Matching vendor invoices or contractor timesheets before releasing bank transfers.
+- **Wallet credits & promotional issuance:** Letting support agents issue small goodwill credits automatically while holding larger balance adjustments for review.
+- **Privileged billing or account changes:** Gating credit-limit increases, plan overrides, or risk-hold releases proposed by internal ops agents.
 
 ## Project Layout
 
@@ -105,15 +120,19 @@ spring-mcp-settlement-guard/
     │   │   ├── DemoDataInitializer.java
     │   │   ├── GuardrailConfigurationGuard.java
     │   │   ├── GuardrailProperties.java
-    │   │   └── McpSecurityConfig.java
+    │   │   ├── McpSecurityConfig.java
+    │   │   ├── StripeDemoChargeInitializer.java
+    │   │   └── StripeProperties.java
     │   ├── domain/
     │   │   ├── DeterministicPaymentGateway.java
     │   │   ├── DeterministicReconciler.java
     │   │   ├── OrderAnchorLockService.java
     │   │   ├── OrderSettlementAnchor.java
     │   │   ├── PaymentGatewayPort.java
+    │   │   ├── ProviderRefundLookup.java
     │   │   ├── SettlementInvoiceItem.java
-    │   │   └── SnapshotHasher.java
+    │   │   ├── SnapshotHasher.java
+    │   │   └── StripePaymentGateway.java
     │   ├── guardrail/
     │   │   ├── ApprovalEventOutbox.java
     │   │   ├── ApprovalGateService.java
@@ -122,6 +141,7 @@ spring-mcp-settlement-guard/
     │   │   ├── ApprovalWebhookNotifier.java
     │   │   ├── DemoRefundController.java
     │   │   ├── IdempotencyKeyStore.java
+    │   │   ├── PayoutReconciliationJob.java
     │   │   ├── PayoutResolution.java
     │   │   ├── PayoutResolutionService.java
     │   │   ├── RefundApprovalOrder.java
@@ -136,14 +156,17 @@ spring-mcp-settlement-guard/
     │   ├── V1__baseline_schema.sql
     │   ├── V2__payout_release_and_ledger_guards.sql
     │   ├── V3__unique_transaction_id.sql
-    │   └── V4__four_eyes_resolution_and_event_ids.sql
+    │   ├── V4__four_eyes_resolution_and_event_ids.sql
+    │   └── V5__payout_reconciliation_exception.sql
     └── test/java/io/mcpguard/settlement/
         ├── ApprovalLifecycleIT.java
         ├── GuardrailEdgeCaseIT.java
         ├── DemoEndpointDisabledIT.java
         ├── DeterministicMockAgentTest.java
         ├── ReviewerTokens.java
-        └── config/GuardrailConfigurationGuardTest.java
+        ├── StripeLiveSandboxIT.java
+        ├── config/GuardrailConfigurationGuardTest.java
+        └── domain/StripePaymentGatewayTest.java
 ```
 
 ## Quick Start (3 Minutes)
@@ -153,6 +176,9 @@ Prerequisites: JDK 17+ (or JDK 21). The default run uses embedded H2, seeds four
 ```bash
 # Default demo on H2 (SSE at http://localhost:8080/sse)
 ./mvnw spring-boot:run
+
+# Live Stripe sandbox (Test Mode): seeds 4 captured PaymentIntents and issues real test refunds
+STRIPE_SECRET_KEY=sk_test_... ./mvnw spring-boot:run -Dspring-boot.run.profiles=stripe
 
 # PostgreSQL 16. Demo seed and /api/demo are disabled; bring your own secrets.
 docker compose up -d
@@ -214,6 +240,16 @@ Key verified scenarios in `ApprovalLifecycleIT`, `GuardrailEdgeCaseIT` & `Determ
 - Outbox rows left unpublished are redelivered with their original `eventId` after the grace period, and fresh rows are left to the request thread.
 - Startup refuses blank secrets, reviewer secrets shorter than 32 bytes, and the published demo secrets outside demo mode; the demo endpoint returns `404` when disabled.
 
+## Protocol & Caller Boundaries
+
+An MCP server only controls what happens after a tool call reaches it. Integrators own the host runtime on the other side of the wire:
+
+- **Finished chat turns do not reopen themselves:** Once an agent turn ends with `PENDING_APPROVAL`, a reviewer approving that refund later cannot push a follow-up sentence back into an already closed Claude Desktop or Cursor turn. Close the customer loop by polling `get_approval_status` or consuming the approval webhook / outbox event in your own application.
+- **Host UI "Allow tool" clicks are not finance approval:** A client's tool-execution dialog authorizes the MCP request; it carries no verified reviewer identity and never substitutes for a signed `FINANCE_APPROVER` JWT on `/api/approvals/{approvalId}/approve` (one reviewer to release `PENDING_APPROVAL`, two distinct reviewers to resolve `PAYOUT_UNKNOWN`).
+- **A new `idempotencyKey` after settlement is a new refund:** If the caller omits `idempotencyKey`, the server derives a one-time SHA-256 key from `(orderId, amount, currency, reasonCode)`. If an agent switches to a new key while an identical refund is still `PENDING_APPROVAL`, `EXECUTING`, or `PAYOUT_UNKNOWN`, the call links to that in-flight request. Once a refund has settled (`EXECUTED`), however, sending a brand-new `idempotencyKey` declares an intentional second refund (up to the order's remaining refundable balance).
+- **Dropped calls recover by re-querying:** If the transport disconnects after money moved, the server has no channel to inject the lost response into the dead call. Retry `issue_customer_refund` with the same `idempotencyKey` (or call `get_approval_status`) to read the stored receipt.
+- **Provider settlement and the local ledger cannot commit as one transaction:** A payment processor can settle, fail, or reverse asynchronously hours later. Timeouts freeze immediately as `PAYOUT_UNKNOWN`, and `PayoutReconciliationJob` flags late provider drift for human reconciliation.
+
 ## Production Notes
 
 - **Reviewer identity:** the demo signs reviewer tokens with a shared HS256 secret. With an identity provider, replace the `reviewerJwtDecoder` bean in `McpSecurityConfig` with `JwtDecoders.fromIssuerLocation(...)` and map your provider's role claim to `FINANCE_APPROVER`. The agent key stays a machine credential; rotate it like any API secret.
@@ -236,7 +272,7 @@ curl -X POST http://localhost:8080/api/approvals/apr_.../release-payout -H "Auth
 curl -X POST http://localhost:8080/api/approvals/apr_.../payout-resolution/approve -H "Authorization: Bearer $TOKEN_B"
 ```
 
-- **Payment adapter:** `DeterministicPaymentGateway` is a sandbox. A real adapter must forward the idempotency key to the provider and implement `lookupRefund` with the states succeeded, pending, failed, cancelled, and not found. It must throw on outages. `not found` does not mean the provider will never pay. `cancelRefund` is required when the provider can void an in-flight refund. `PayoutReconciliationJob` rechecks booked and released refunds and records mismatches for a person to handle.
+- **Payment adapter:** `DeterministicPaymentGateway` is the default offline sandbox, and `StripePaymentGateway` (`--spring.profiles.active=stripe`) is a live Stripe REST reference adapter that forwards `Idempotency-Key` headers and reconciles refunds via metadata. Any custom adapter must forward the idempotency key to the provider and implement `lookupRefund` with the states succeeded, pending, failed, cancelled, and not found. It must throw on outages. `not found` does not mean the provider will never pay. `cancelRefund` is required when the provider can void an in-flight refund. `PayoutReconciliationJob` rechecks booked and released refunds and records mismatches for a person to handle.
 - **Approval events:** delivery is at least once. Consumers should drop duplicates by `eventId`. With several application nodes, every node's sweeper may redeliver the same row; add a distributed lock (for example ShedLock) if duplicate deliveries are costly.
 - **Audit log:** audit writes run after the business commit and a failure is logged, not retried, so money movement never depends on the audit table. If audit completeness is a compliance requirement, write audit records through the same outbox.
 - **Rate limits and tenancy:** the demo has one agent and one tenant. Add per-agent rate limits on `issue_customer_refund` (for example at the API gateway), and scope `get_approval_status` and approval ids to the calling tenant before serving several customers.

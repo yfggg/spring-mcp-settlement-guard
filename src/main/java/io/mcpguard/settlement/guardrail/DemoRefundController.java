@@ -61,7 +61,7 @@ public class DemoRefundController {
             @NotNull @DecimalMin("0.01") @Digits(integer = 10, fraction = 2) BigDecimal amount,
             @Pattern(regexp = "^[A-Za-z]{3}$") String currency,
             @Size(max = 64) @Pattern(regexp = "^[A-Za-z0-9_]+$") String reasonCode,
-            @NotBlank @Size(min = 8, max = 128) @Pattern(regexp = "^[A-Za-z0-9._:-]+$") String idempotencyKey
+            @Size(max = 128) @Pattern(regexp = "^$|^[A-Za-z0-9._:-]{8,128}$") String idempotencyKey
     ) {
     }
 }

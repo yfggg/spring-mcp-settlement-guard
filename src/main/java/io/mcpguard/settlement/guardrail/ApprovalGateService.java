@@ -886,9 +886,6 @@ public class ApprovalGateService {
         if (!StringUtils.hasText(raw.orderId())) {
             throw new GuardrailExceptions.InvalidSettlementRequestException("orderId is required");
         }
-        if (!StringUtils.hasText(raw.idempotencyKey())) {
-            throw new GuardrailExceptions.InvalidSettlementRequestException("idempotencyKey is required");
-        }
         if (raw.amount() == null || raw.amount().compareTo(BigDecimal.ZERO) <= 0) {
             throw new GuardrailExceptions.InvalidSettlementRequestException("amount must be positive");
         }
@@ -906,12 +903,23 @@ public class ApprovalGateService {
                 ? raw.reasonCode().trim().toUpperCase(Locale.ROOT)
                 : "OVERCHARGE_ADJUSTMENT";
 
-        return new RefundCommand(
+        RefundCommand normalized = new RefundCommand(
                 raw.orderId().trim(),
                 DeterministicReconciler.scale(raw.amount()),
                 normalizedCurrency,
                 normalizedReason,
-                raw.idempotencyKey().trim()
+                StringUtils.hasText(raw.idempotencyKey()) ? raw.idempotencyKey().trim() : ""
+        );
+        if (StringUtils.hasText(normalized.idempotencyKey())) {
+            return normalized;
+        }
+        // No caller key: the one-time key is the hash of the business fields, so the same request cannot pay twice.
+        return new RefundCommand(
+                normalized.orderId(),
+                normalized.amount(),
+                normalized.currency(),
+                normalized.reasonCode(),
+                computeRequestFingerprint(normalized)
         );
     }
 

@@ -117,6 +117,33 @@ class ApprovalLifecycleIT {
     }
 
     @Test
+    void omittedIdempotencyKeyIsBoundToTheRequestFingerprint() {
+        seedInvoice("ORD-DERIVE-01", "100.00");
+        ApprovalGateService.RefundCommand raw = new ApprovalGateService.RefundCommand(
+                "ORD-DERIVE-01", new BigDecimal("20.00"), "USD", "FEE_DIFF", null);
+
+        ApprovalGateService.RefundDecision first = approvalGateService.submitRefund(raw);
+        ApprovalGateService.RefundDecision second = approvalGateService.submitRefund(
+                new ApprovalGateService.RefundCommand(
+                        "ORD-DERIVE-01", new BigDecimal("20.00"), "usd", " fee_diff ", "  "));
+        assertThat(second.refundTxId()).isEqualTo(first.refundTxId());
+        assertThat(paymentGateway.getExecutionCountForOrder("ORD-DERIVE-01")).isEqualTo(1);
+
+        String storedKey = jdbcTemplate.queryForObject(
+                "SELECT idempotency_key FROM refund_approval_order WHERE approval_id = ?",
+                String.class,
+                first.approvalId());
+        assertThat(storedKey).isEqualTo(ApprovalGateService.computeRequestFingerprint(
+                new ApprovalGateService.RefundCommand(
+                        "ORD-DERIVE-01", new BigDecimal("20.00"), "USD", "FEE_DIFF", null)));
+
+        assertThat(approvalGateService.submitRefund(new ApprovalGateService.RefundCommand(
+                "ORD-DERIVE-01", new BigDecimal("20.00"), "USD", "GOODWILL", null)).refundTxId())
+                .isNotEqualTo(first.refundTxId());
+        assertThat(paymentGateway.getExecutionCountForOrder("ORD-DERIVE-01")).isEqualTo(2);
+    }
+
+    @Test
     void autoExecutesLowRiskRefundAtOrBelow50AndLogsZeroTokenAudit() throws Exception {
         String payload = objectMapper.writeValueAsString(Map.of(
                 "orderId", "ORD-2026-8842",

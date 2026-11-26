@@ -58,10 +58,11 @@ public class RefundActionMcpTools {
             @Pattern(regexp = "^[A-Za-z0-9_]+$", message = "must contain only letters, digits or '_'")
             String reasonCode,
 
-            @ToolParam(description = "Stable idempotency key (8-128 chars). Reuse this exact key after every timeout, in-progress response, or retry. A new key is a new refund and can pay again.")
-            @NotBlank
-            @Size(min = 8, max = 128)
-            @Pattern(regexp = "^[A-Za-z0-9._:-]+$", message = "must contain only letters, digits, '.', '_', ':' or '-'")
+            @ToolParam(
+                    description = "Optional idempotency key (8-128 chars). Omit it and the server uses a SHA-256 of order, amount, currency, and reason, so the same request pays once. Pass your own key only when a second identical refund is intentional; then reuse that exact key on every retry.",
+                    required = false)
+            @Size(max = 128)
+            @Pattern(regexp = "^$|^[A-Za-z0-9._:-]{8,128}$", message = "must contain only letters, digits, '.', '_', ':' or '-'")
             String idempotencyKey) {
 
         return approvalGateService.submitRefund(new ApprovalGateService.RefundCommand(

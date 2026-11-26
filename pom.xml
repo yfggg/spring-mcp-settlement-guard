@@ -15,7 +15,7 @@
     <artifactId>spring-mcp-settlement-guard</artifactId>
     <version>0.1.0</version>
     <name>spring-mcp-settlement-guard</name>
-    <description>Production-grade reference architecture for exposing financial &amp; state-mutating Spring Boot APIs to AI Agents over MCP.</description>
+    <description>Server-side Spring Boot &amp; Spring AI MCP guardrail for money movement: idempotent Stripe refunds, row-locked velocity caps, async JWT approval holds, and four-eyes reconciliation.</description>
 
     <properties>
         <java.version>17</java.version>

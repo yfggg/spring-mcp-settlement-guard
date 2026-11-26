@@ -75,3 +75,16 @@ guardrail:
   demo:
     seed-enabled: false
     http-enabled: false
+
+---
+spring:
+  config:
+    activate:
+      on-profile: stripe
+guardrail:
+  provider:
+    cancel-supported: false
+  stripe:
+    secret-key: ${STRIPE_SECRET_KEY:}
+    api-base-url: ${STRIPE_API_BASE_URL:https://api.stripe.com}
+    seed-test-charges: ${STRIPE_SEED_TEST_CHARGES:true}
