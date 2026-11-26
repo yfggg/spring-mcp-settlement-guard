@@ -7,6 +7,7 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 
 import io.mcpguard.settlement.config.McpSecurityConfig;
 import io.mcpguard.settlement.domain.DeterministicPaymentGateway;
+import io.mcpguard.settlement.domain.ProviderRefundLookup;
 import io.mcpguard.settlement.domain.SettlementInvoiceItem;
 import io.mcpguard.settlement.domain.SettlementInvoiceRepository;
 import io.mcpguard.settlement.guardrail.ApprovalGateService;
@@ -16,6 +17,7 @@ import io.mcpguard.settlement.guardrail.ApprovalStatus;
 import io.mcpguard.settlement.guardrail.ApprovalWebhookNotifier;
 import io.mcpguard.settlement.guardrail.IdempotencyKeyStore;
 import io.mcpguard.settlement.guardrail.IdempotencyRecordRepository;
+import io.mcpguard.settlement.guardrail.PayoutReconciliationJob;
 import io.mcpguard.settlement.guardrail.PayoutResolution;
 import io.mcpguard.settlement.guardrail.PayoutResolutionService;
 import io.mcpguard.settlement.guardrail.StaleExecutionSweeper;
@@ -66,6 +68,7 @@ class GuardrailEdgeCaseIT {
     @Autowired IdempotencyRecordRepository idempotencyRecords;
     @Autowired IdempotencyKeyStore keyStore;
     @Autowired StaleExecutionSweeper sweeper;
+    @Autowired PayoutReconciliationJob reconciliation;
     @Autowired ApprovalWebhookNotifier notifier;
     @Autowired JdbcTemplate jdbc;
     @Autowired MockMvc mockMvc;
@@ -256,7 +259,7 @@ class GuardrailEdgeCaseIT {
         assertThat(keyState("edge-07")).isEqualTo("UNKNOWN_SUSPENDED");
 
         // The gateway did pay, so CONFIRM is proposed; the ledger still refuses it on approval.
-        String providerTx = gateway.lookupRefund("ORD-EDGE-07", "edge-07").orElseThrow().transactionId();
+        String providerTx = gateway.lookupRefund("ORD-EDGE-07", "edge-07").refund().transactionId();
         resolutions.propose(approvalId, REVIEWER, PayoutResolution.Action.CONFIRM, providerTx);
         assertThat(outcome(() -> resolutions.approve(approvalId, SECOND_REVIEWER)))
                 .startsWith("EX:ApprovalStateConflictException");
@@ -278,7 +281,7 @@ class GuardrailEdgeCaseIT {
         outcome(() -> gate.submitRefund(cmd("ORD-EDGE-08B", "20.00", "FEE_DIFF", "edge-08b")));
         String approvalA = approvalIdOf("ORD-EDGE-08A");
         String approvalB = approvalIdOf("ORD-EDGE-08B");
-        String txA = gateway.lookupRefund("ORD-EDGE-08A", "edge-08a").orElseThrow().transactionId();
+        String txA = gateway.lookupRefund("ORD-EDGE-08A", "edge-08a").refund().transactionId();
 
         // B's gateway record has a different id, so A's id is refused for B.
         assertThat(outcomeOf(() -> resolutions.propose(approvalB, REVIEWER, PayoutResolution.Action.CONFIRM, txA)))
@@ -362,7 +365,7 @@ class GuardrailEdgeCaseIT {
         gateway.simulateTimeoutAfterSettlementForOrder("ORD-EDGE-13");
         outcome(() -> gate.submitRefund(cmd("ORD-EDGE-13", "20.00", "FEE_DIFF", "edge-13")));
         String approvalId = approvalIdOf("ORD-EDGE-13");
-        String providerTx = gateway.lookupRefund("ORD-EDGE-13", "edge-13").orElseThrow().transactionId();
+        String providerTx = gateway.lookupRefund("ORD-EDGE-13", "edge-13").refund().transactionId();
         resolutions.propose(approvalId, REVIEWER, PayoutResolution.Action.CONFIRM, providerTx);
 
         ExecutorService pool = Executors.newFixedThreadPool(2);
@@ -592,6 +595,89 @@ class GuardrailEdgeCaseIT {
                 .isEqualTo("EXECUTED");
     }
 
+    @Test
+    void providerStateGatesConfirmAndRelease() {
+        String orderId = "ORD-EDGE-23";
+        String key = IdempotencyKeys.next("edge-23");
+        seed(orderId, "100.00");
+        gateway.simulateTimeoutForOrder(orderId);
+        outcome(() -> gate.submitRefund(cmd(orderId, "20.00", "FEE_DIFF", key)));
+        String approvalId = approvalIdOf(orderId);
+        gateway.clearTimeoutForOrder(orderId);
+
+        gateway.recordProviderState(orderId, key, ProviderRefundLookup.State.PENDING, false,
+                "tx_pending", new BigDecimal("20.00"), "USD");
+        assertThat(outcomeOf(() -> resolutions.propose(approvalId, REVIEWER, PayoutResolution.Action.CONFIRM, "tx_pending")))
+                .contains("still processing");
+
+        gateway.recordProviderState(orderId, key, ProviderRefundLookup.State.FAILED, false,
+                "tx_failed", new BigDecimal("20.00"), "USD");
+        assertThat(outcomeOf(() -> resolutions.propose(approvalId, REVIEWER, PayoutResolution.Action.CONFIRM, "tx_failed")))
+                .contains("cannot be confirmed");
+        gateway.setCancelSupported(false);
+        assertThat(outcomeOf(() -> resolutions.propose(approvalId, REVIEWER, PayoutResolution.Action.RELEASE, null)))
+                .contains("not terminal");
+    }
+
+    @Test
+    void releaseWithoutCancelWaitsForTheSettlementWindow() {
+        String orderId = "ORD-EDGE-24";
+        String key = IdempotencyKeys.next("edge-24");
+        seed(orderId, "100.00");
+        gateway.setCancelSupported(false);
+        gateway.simulateTimeoutForOrder(orderId);
+        outcome(() -> gate.submitRefund(cmd(orderId, "20.00", "FEE_DIFF", key)));
+        String approvalId = approvalIdOf(orderId);
+
+        assertThat(outcomeOf(() -> resolutions.propose(approvalId, REVIEWER, PayoutResolution.Action.RELEASE, null)))
+                .contains("settlement window");
+
+        jdbc.update("UPDATE refund_approval_order SET created_at = CURRENT_TIMESTAMP - INTERVAL '48' HOUR "
+                + "WHERE approval_id = ?", approvalId);
+        resolutions.propose(approvalId, REVIEWER, PayoutResolution.Action.RELEASE, null);
+        assertThat(resolutions.approve(approvalId, SECOND_REVIEWER).status()).isEqualTo("PAYOUT_RELEASED");
+    }
+
+    @Test
+    void reconciliationRecordsProviderDriftOnce() {
+        String orderId = "ORD-EDGE-25";
+        String key = IdempotencyKeys.next("edge-25");
+        seed(orderId, "100.00");
+        RefundDecision paid = gate.submitRefund(cmd(orderId, "20.00", "FEE_DIFF", key));
+        assertThat(paid.status()).isEqualTo("EXECUTED");
+        gateway.recordProviderState(orderId, key, ProviderRefundLookup.State.NOT_FOUND, false, null, null, null);
+
+        assertThat(reconciliation.reconcile(Instant.now())).isGreaterThanOrEqualTo(1);
+        assertThat(openMismatches(paid.approvalId())).isEqualTo(1L);
+        reconciliation.reconcile(Instant.now());
+        assertThat(openMismatches(paid.approvalId())).isEqualTo(1L);
+
+        String releaseOrder = "ORD-EDGE-26";
+        String releaseKey = IdempotencyKeys.next("edge-26");
+        seed(releaseOrder, "100.00");
+        gateway.simulateTimeoutForOrder(releaseOrder);
+        outcome(() -> gate.submitRefund(cmd(releaseOrder, "15.00", "FEE_DIFF", releaseKey)));
+        String releaseId = approvalIdOf(releaseOrder);
+        gateway.clearTimeoutForOrder(releaseOrder);
+        resolutions.propose(releaseId, REVIEWER, PayoutResolution.Action.RELEASE, null);
+        resolutions.approve(releaseId, SECOND_REVIEWER);
+        gateway.recordProviderState(releaseOrder, releaseKey, ProviderRefundLookup.State.SUCCEEDED, true,
+                "tx_late", new BigDecimal("15.00"), "USD");
+        reconciliation.reconcile(Instant.now());
+        assertThat(jdbc.queryForObject(
+                "SELECT mismatch_code FROM payout_reconciliation_exception WHERE approval_id = ?",
+                String.class, releaseId)).isEqualTo(PayoutReconciliationJob.PROVIDER_SUCCEEDED_AFTER_RELEASE);
+    }
+
+    @Test
+    void resetCountersDropsRecordedProviderRefunds() {
+        String key = IdempotencyKeys.next("edge-27");
+        gateway.recordProviderState("ORD-EDGE-27", key, ProviderRefundLookup.State.SUCCEEDED, true,
+                "tx_keep", new BigDecimal("10.00"), "USD");
+        gateway.resetCounters();
+        assertThat(gateway.lookupRefund("ORD-EDGE-27", key).state()).isEqualTo(ProviderRefundLookup.State.NOT_FOUND);
+    }
+
     // ---- Helpers ----
 
     private int status(RequestBuilder request) throws Exception {
@@ -636,6 +722,12 @@ class GuardrailEdgeCaseIT {
 
     private String statusOf(String approvalId) {
         return jdbc.queryForObject("SELECT status FROM refund_approval_order WHERE approval_id = ?", String.class, approvalId);
+    }
+
+    private Long openMismatches(String approvalId) {
+        return jdbc.queryForObject(
+                "SELECT COUNT(*) FROM payout_reconciliation_exception WHERE open_approval_id = ?",
+                Long.class, approvalId);
     }
 
     private static RefundCommand cmd(String orderId, String amount, String reason, String key) {

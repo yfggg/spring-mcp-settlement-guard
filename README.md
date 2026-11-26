@@ -217,7 +217,7 @@ Key verified scenarios in `ApprovalLifecycleIT`, `GuardrailEdgeCaseIT` & `Determ
 ## Production Notes
 
 - **Reviewer identity:** the demo signs reviewer tokens with a shared HS256 secret. With an identity provider, replace the `reviewerJwtDecoder` bean in `McpSecurityConfig` with `JwtDecoders.fromIssuerLocation(...)` and map your provider's role claim to `FINANCE_APPROVER`. The agent key stays a machine credential; rotate it like any API secret.
-- **`PAYOUT_UNKNOWN`:** the request stays reserved and cannot be approved again. One reviewer proposes, a different reviewer approves:
+- **`PAYOUT_UNKNOWN`:** the request stays reserved and cannot be approved again. One reviewer proposes, a different reviewer approves. Confirm is allowed only when the provider reports the refund as succeeded, with the same transaction id, amount, and currency. A pending or failed provider refund is refused. Release calls the provider cancel when that provider supports it, and proceeds only after the provider then reports the refund cancelled or terminally failed. When cancel is not supported, release is allowed only after the settlement window if the provider still reports no refund.
 
 ```bash
 TOKEN_A=$(java tools/MintReviewerToken.java finance-lead@company.com)
@@ -228,14 +228,15 @@ curl -X POST http://localhost:8080/api/approvals/apr_.../confirm-payout \
   -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN_A" \
   -d '{"transactionId":"tx_provider_123"}'
 
-# Money did not move: propose RELEASE (refused if the gateway shows a refund).
+# Money did not move: propose RELEASE. Allowed after a successful provider cancel, or, when cancel
+# is unsupported, only after the settlement window if the provider still has no refund.
 curl -X POST http://localhost:8080/api/approvals/apr_.../release-payout -H "Authorization: Bearer $TOKEN_A"
 
 # A second reviewer applies the open proposal (or rejects it with /payout-resolution/reject).
 curl -X POST http://localhost:8080/api/approvals/apr_.../payout-resolution/approve -H "Authorization: Bearer $TOKEN_B"
 ```
 
-- **Payment adapter:** `DeterministicPaymentGateway` is a sandbox. A real adapter must forward the idempotency key to the provider (Stripe, Adyen, etc.) so the provider also deduplicates, and must implement `lookupRefund` with the provider's own search; it should throw on outages rather than return "not found".
+- **Payment adapter:** `DeterministicPaymentGateway` is a sandbox. A real adapter must forward the idempotency key to the provider and implement `lookupRefund` with the states succeeded, pending, failed, cancelled, and not found. It must throw on outages. `not found` does not mean the provider will never pay. `cancelRefund` is required when the provider can void an in-flight refund. `PayoutReconciliationJob` rechecks booked and released refunds and records mismatches for a person to handle.
 - **Approval events:** delivery is at least once. Consumers should drop duplicates by `eventId`. With several application nodes, every node's sweeper may redeliver the same row; add a distributed lock (for example ShedLock) if duplicate deliveries are costly.
 - **Audit log:** audit writes run after the business commit and a failure is logged, not retried, so money movement never depends on the audit table. If audit completeness is a compliance requirement, write audit records through the same outbox.
 - **Rate limits and tenancy:** the demo has one agent and one tenant. Add per-agent rate limits on `issue_customer_refund` (for example at the API gateway), and scope `get_approval_status` and approval ids to the calling tenant before serving several customers.

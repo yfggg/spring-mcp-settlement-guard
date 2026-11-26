@@ -29,3 +29,8 @@ guardrail:
   demo:
     seed-enabled: true
     http-enabled: true
+  provider:
+    cancel-supported: true
+    settlement-window-hours: 24
+    reconcile-lookback-days: 7
+    reconcile-interval-ms: 3600000

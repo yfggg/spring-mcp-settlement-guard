@@ -1,10 +1,9 @@
 package io.mcpguard.settlement.domain;
 
+import io.mcpguard.settlement.config.GuardrailProperties;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
-import java.util.Map;
-import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -30,12 +29,19 @@ import org.springframework.stereotype.Component;
 public class DeterministicPaymentGateway implements PaymentGatewayPort {
 
     private final ConcurrentHashMap<String, AtomicInteger> orderExecutionCounts = new ConcurrentHashMap<>();
-    private final Map<String, PaymentExecutionResult> refundsByReference = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, StoredRefund> refundsByReference = new ConcurrentHashMap<>();
     private final AtomicInteger totalExecutions = new AtomicInteger(0);
     private final Set<String> timeoutOrders = ConcurrentHashMap.newKeySet();
     private final Set<String> timeoutAfterSettlementOrders = ConcurrentHashMap.newKeySet();
     private final AtomicBoolean lookupOutage = new AtomicBoolean(false);
+    private final AtomicBoolean cancelSupported;
     private final AtomicReference<ExecutionPause> executionPause = new AtomicReference<>();
+    private final boolean cancelSupportedByConfig;
+
+    public DeterministicPaymentGateway(GuardrailProperties properties) {
+        this.cancelSupportedByConfig = properties.provider().cancelSupported();
+        this.cancelSupported = new AtomicBoolean(cancelSupportedByConfig);
+    }
 
     @Override
     public PaymentExecutionResult executeRefund(
@@ -52,10 +58,14 @@ public class DeterministicPaymentGateway implements PaymentGatewayPort {
         totalExecutions.incrementAndGet();
         orderExecutionCounts.computeIfAbsent(orderId, k -> new AtomicInteger(0)).incrementAndGet();
         String reference = reference(orderId, idempotencyRef);
-        PaymentExecutionResult existing = refundsByReference.get(reference);
-        if (existing != null) {
-            // Providers deduplicate on the idempotency reference; a repeat returns the original refund.
-            return existing;
+        StoredRefund existing = refundsByReference.get(reference);
+        if (existing != null && existing.state() == ProviderRefundLookup.State.SUCCEEDED && existing.refund() != null) {
+            return existing.refund();
+        }
+        if (existing != null && existing.terminal()
+                && (existing.state() == ProviderRefundLookup.State.CANCELLED
+                || existing.state() == ProviderRefundLookup.State.FAILED)) {
+            throw new GatewayTimeoutException("Provider will not pay idempotency reference " + reference);
         }
 
         String suffix = UUID.nameUUIDFromBytes(reference.getBytes(StandardCharsets.UTF_8))
@@ -69,7 +79,7 @@ public class DeterministicPaymentGateway implements PaymentGatewayPort {
                 currency,
                 Instant.now()
         );
-        refundsByReference.put(reference, result);
+        refundsByReference.put(reference, StoredRefund.succeeded(result));
         if (timeoutAfterSettlementOrders.contains(orderId)) {
             throw new GatewayTimeoutException("Simulated response loss after settlement for order " + orderId);
         }
@@ -77,11 +87,62 @@ public class DeterministicPaymentGateway implements PaymentGatewayPort {
     }
 
     @Override
-    public Optional<PaymentExecutionResult> lookupRefund(String orderId, String idempotencyRef) {
+    public ProviderRefundLookup lookupRefund(String orderId, String idempotencyRef) {
         if (lookupOutage.get()) {
             throw new GatewayTimeoutException("Simulated gateway lookup outage");
         }
-        return Optional.ofNullable(refundsByReference.get(reference(orderId, idempotencyRef)));
+        StoredRefund stored = refundsByReference.get(reference(orderId, idempotencyRef));
+        return stored == null ? ProviderRefundLookup.notFound() : stored.toLookup();
+    }
+
+    @Override
+    public void cancelRefund(String orderId, String idempotencyRef) {
+        if (!cancelSupported.get()) {
+            throw new CancelNotSupportedException("This provider cannot cancel refunds");
+        }
+        if (lookupOutage.get()) {
+            throw new GatewayTimeoutException("Simulated gateway lookup outage");
+        }
+        String reference = reference(orderId, idempotencyRef);
+        StoredRefund stored = refundsByReference.get(reference);
+        if (stored != null && stored.state() == ProviderRefundLookup.State.SUCCEEDED) {
+            return;
+        }
+        refundsByReference.put(reference, StoredRefund.cancelled());
+    }
+
+    @Override
+    public boolean cancelSupported() {
+        return cancelSupported.get();
+    }
+
+    public void setCancelSupported(boolean supported) {
+        cancelSupported.set(supported);
+    }
+
+    /** Installs a provider state without going through {@link #executeRefund}. Used to exercise reconciliation. */
+    public void recordProviderState(
+            String orderId,
+            String idempotencyRef,
+            ProviderRefundLookup.State state,
+            boolean terminal,
+            String transactionId,
+            BigDecimal amount,
+            String currency) {
+        PaymentExecutionResult result = state == ProviderRefundLookup.State.NOT_FOUND
+                ? null
+                : new PaymentExecutionResult(
+                        transactionId,
+                        orderId,
+                        amount == null ? null : DeterministicReconciler.scale(amount),
+                        currency,
+                        Instant.now());
+        String reference = reference(orderId, idempotencyRef);
+        if (state == ProviderRefundLookup.State.NOT_FOUND) {
+            refundsByReference.remove(reference);
+            return;
+        }
+        refundsByReference.put(reference, new StoredRefund(state, terminal, result));
     }
 
     public int getExecutionCountForOrder(String orderId) {
@@ -118,7 +179,7 @@ public class DeterministicPaymentGateway implements PaymentGatewayPort {
         executionPause.set(new ExecutionPause(entered, release));
     }
 
-    /** Clears counters and failure modes. Recorded refunds stay, as they would at a real provider. */
+    /** Clears counters, failure modes, and recorded provider refunds. */
     public void resetCounters() {
         orderExecutionCounts.clear();
         totalExecutions.set(0);
@@ -126,6 +187,8 @@ public class DeterministicPaymentGateway implements PaymentGatewayPort {
         timeoutAfterSettlementOrders.clear();
         lookupOutage.set(false);
         executionPause.set(null);
+        refundsByReference.clear();
+        cancelSupported.set(cancelSupportedByConfig);
     }
 
     private static String reference(String orderId, String idempotencyRef) {
@@ -145,6 +208,24 @@ public class DeterministicPaymentGateway implements PaymentGatewayPort {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new GatewayTimeoutException("Simulated gateway pause was interrupted");
+        }
+    }
+
+    private record StoredRefund(
+            ProviderRefundLookup.State state,
+            boolean terminal,
+            PaymentExecutionResult refund
+    ) {
+        static StoredRefund succeeded(PaymentExecutionResult refund) {
+            return new StoredRefund(ProviderRefundLookup.State.SUCCEEDED, true, refund);
+        }
+
+        static StoredRefund cancelled() {
+            return new StoredRefund(ProviderRefundLookup.State.CANCELLED, true, null);
+        }
+
+        ProviderRefundLookup toLookup() {
+            return ProviderRefundLookup.of(state, terminal, refund);
         }
     }
 

@@ -16,7 +16,8 @@ class GuardrailConfigurationGuardTest {
                 new GuardrailProperties.Mandate("USD", new BigDecimal("50.00"), new BigDecimal("200.00"), 24),
                 new GuardrailProperties.Security(agent, reviewerSecret, "spring-mcp-settlement-guard", hmac),
                 new GuardrailProperties.Recovery(15, 60000, 30),
-                new GuardrailProperties.Demo(seed, http));
+                new GuardrailProperties.Demo(seed, http),
+                new GuardrailProperties.Provider(true, 24, 7, 3_600_000));
     }
 
     private static void runGuard(GuardrailProperties properties) throws Exception {

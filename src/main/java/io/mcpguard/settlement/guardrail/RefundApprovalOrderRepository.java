@@ -162,4 +162,13 @@ public interface RefundApprovalOrderRepository extends JpaRepository<RefundAppro
                AND COALESCE(r.reviewedAt, r.createdAt) < :cutoff
             """)
     int markStaleExecutionsUnknown(@Param("cutoff") Instant cutoff);
+
+    @Query("""
+            SELECT r FROM RefundApprovalOrder r
+             WHERE r.status IN :statuses
+               AND COALESCE(r.reviewedAt, r.createdAt) >= :since
+            """)
+    List<RefundApprovalOrder> findBookedSince(
+            @Param("statuses") Collection<ApprovalStatus> statuses,
+            @Param("since") Instant since);
 }

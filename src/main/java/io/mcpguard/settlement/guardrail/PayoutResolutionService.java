@@ -1,12 +1,13 @@
 package io.mcpguard.settlement.guardrail;
 
+import io.mcpguard.settlement.config.GuardrailProperties;
 import io.mcpguard.settlement.domain.PaymentGatewayPort;
+import io.mcpguard.settlement.domain.ProviderRefundLookup;
 import io.mcpguard.settlement.telemetry.ToolExecutionAuditLog;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Locale;
-import java.util.Optional;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
@@ -35,6 +36,7 @@ public class PayoutResolutionService {
     private final PaymentGatewayPort paymentGateway;
     private final ApprovalGateService approvalGateService;
     private final ToolExecutionAuditLog auditLog;
+    private final GuardrailProperties properties;
     private final TransactionTemplate txTemplate;
 
     public PayoutResolutionService(
@@ -43,12 +45,14 @@ public class PayoutResolutionService {
             PaymentGatewayPort paymentGateway,
             ApprovalGateService approvalGateService,
             ToolExecutionAuditLog auditLog,
+            GuardrailProperties properties,
             PlatformTransactionManager transactionManager) {
         this.approvalRepository = approvalRepository;
         this.resolutionRepository = resolutionRepository;
         this.paymentGateway = paymentGateway;
         this.approvalGateService = approvalGateService;
         this.auditLog = auditLog;
+        this.properties = properties;
         this.txTemplate = new TransactionTemplate(transactionManager);
     }
 
@@ -154,31 +158,99 @@ public class PayoutResolutionService {
     }
 
     private void verifyAgainstGateway(RefundApprovalOrder order, PayoutResolution.Action action, String txId) {
-        Optional<PaymentGatewayPort.PaymentExecutionResult> found;
-        try {
-            found = paymentGateway.lookupRefund(order.getOrderId(), order.getIdempotencyKey());
-        } catch (RuntimeException gatewayFailure) {
-            throw new GuardrailExceptions.GatewayVerificationUnavailableException(
-                    "Payment gateway lookup failed for " + order.getApprovalId() + "; try again later", gatewayFailure);
-        }
+        ProviderRefundLookup lookup = readProvider(order);
         if (action == PayoutResolution.Action.CONFIRM) {
-            PaymentGatewayPort.PaymentExecutionResult refund = found.orElseThrow(() ->
-                    new GuardrailExceptions.ApprovalStateConflictException(
-                            "The gateway has no refund for " + order.getApprovalId() + "; it cannot be confirmed"));
-            if (!refund.transactionId().equals(txId)) {
-                throw new GuardrailExceptions.ApprovalStateConflictException(
-                        "The gateway transaction id for " + order.getApprovalId() + " does not match " + txId);
+            requireSucceeded(order, lookup, txId);
+            return;
+        }
+        if (paymentGateway.cancelSupported() && lookup.state() != ProviderRefundLookup.State.SUCCEEDED) {
+            try {
+                paymentGateway.cancelRefund(order.getOrderId(), order.getIdempotencyKey());
+            } catch (PaymentGatewayPort.CancelNotSupportedException unsupported) {
+                requireReleaseWithoutCancel(order, lookup);
+                return;
+            } catch (RuntimeException gatewayFailure) {
+                throw unavailable(order, gatewayFailure);
             }
-            if (refund.amount().compareTo(order.getAmount()) != 0
-                    || !refund.currency().equalsIgnoreCase(order.getCurrency())) {
-                throw new GuardrailExceptions.ApprovalStateConflictException(
-                        "The gateway amount or currency for " + order.getApprovalId() + " differs from the approved snapshot");
-            }
-        } else if (found.isPresent()) {
+            lookup = readProvider(order);
+        }
+        requireSafeToRelease(order, lookup);
+    }
+
+    private ProviderRefundLookup readProvider(RefundApprovalOrder order) {
+        try {
+            return paymentGateway.lookupRefund(order.getOrderId(), order.getIdempotencyKey());
+        } catch (RuntimeException gatewayFailure) {
+            throw unavailable(order, gatewayFailure);
+        }
+    }
+
+    private void requireSucceeded(RefundApprovalOrder order, ProviderRefundLookup lookup, String txId) {
+        if (lookup.state() == ProviderRefundLookup.State.PENDING) {
             throw new GuardrailExceptions.ApprovalStateConflictException(
-                    "The gateway shows refund " + found.get().transactionId() + " for " + order.getApprovalId()
+                    "The gateway refund for " + order.getApprovalId() + " is still processing; try again later");
+        }
+        if (lookup.state() == ProviderRefundLookup.State.NOT_FOUND || lookup.refund() == null) {
+            throw new GuardrailExceptions.ApprovalStateConflictException(
+                    "The gateway has no refund for " + order.getApprovalId() + "; it cannot be confirmed");
+        }
+        if (lookup.state() != ProviderRefundLookup.State.SUCCEEDED) {
+            throw new GuardrailExceptions.ApprovalStateConflictException(
+                    "The gateway refund for " + order.getApprovalId() + " is " + lookup.state() + "; it cannot be confirmed");
+        }
+        PaymentGatewayPort.PaymentExecutionResult refund = lookup.refund();
+        if (!refund.transactionId().equals(txId)) {
+            throw new GuardrailExceptions.ApprovalStateConflictException(
+                    "The gateway transaction id for " + order.getApprovalId() + " does not match " + txId);
+        }
+        if (refund.amount().compareTo(order.getAmount()) != 0
+                || !refund.currency().equalsIgnoreCase(order.getCurrency())) {
+            throw new GuardrailExceptions.ApprovalStateConflictException(
+                    "The gateway amount or currency for " + order.getApprovalId() + " differs from the approved snapshot");
+        }
+    }
+
+    private void requireSafeToRelease(RefundApprovalOrder order, ProviderRefundLookup lookup) {
+        if (lookup.state() == ProviderRefundLookup.State.SUCCEEDED) {
+            String providerTx = lookup.refund() == null ? "unknown" : lookup.refund().transactionId();
+            throw new GuardrailExceptions.ApprovalStateConflictException(
+                    "The gateway shows refund " + providerTx + " for " + order.getApprovalId()
                             + "; confirm it instead of releasing");
         }
+        if (lookup.state() == ProviderRefundLookup.State.PENDING) {
+            throw new GuardrailExceptions.ApprovalStateConflictException(
+                    "The gateway refund for " + order.getApprovalId() + " is still processing; try again later");
+        }
+        if (lookup.state() == ProviderRefundLookup.State.CANCELLED
+                || (lookup.state() == ProviderRefundLookup.State.FAILED && lookup.terminal())) {
+            return;
+        }
+        if (lookup.state() == ProviderRefundLookup.State.FAILED) {
+            throw new GuardrailExceptions.ApprovalStateConflictException(
+                    "The gateway failure for " + order.getApprovalId() + " is not terminal; it cannot be released yet");
+        }
+        requireReleaseWithoutCancel(order, lookup);
+    }
+
+    private void requireReleaseWithoutCancel(RefundApprovalOrder order, ProviderRefundLookup lookup) {
+        if (lookup.state() != ProviderRefundLookup.State.NOT_FOUND) {
+            throw new GuardrailExceptions.ApprovalStateConflictException(
+                    "The gateway refund for " + order.getApprovalId() + " is " + lookup.state()
+                            + "; it cannot be released without a terminal provider result");
+        }
+        Instant frozenSince = order.getReviewedAt() != null ? order.getReviewedAt() : order.getCreatedAt();
+        Instant eligibleAt = frozenSince.plus(Duration.ofHours(properties.provider().settlementWindowHours()));
+        if (Instant.now().isBefore(eligibleAt)) {
+            throw new GuardrailExceptions.ApprovalStateConflictException(
+                    "The gateway has no refund for " + order.getApprovalId()
+                            + ", but the settlement window has not elapsed; it cannot be released yet");
+        }
+    }
+
+    private static GuardrailExceptions.GatewayVerificationUnavailableException unavailable(
+            RefundApprovalOrder order, RuntimeException gatewayFailure) {
+        return new GuardrailExceptions.GatewayVerificationUnavailableException(
+                "Payment gateway lookup failed for " + order.getApprovalId() + "; try again later", gatewayFailure);
     }
 
     private RefundApprovalOrder findApproval(String approvalId) {

@@ -440,7 +440,7 @@ public class ApprovalGateService {
 
     /**
      * Releases a frozen reservation. Called only by {@link PayoutResolutionService} after a second reviewer
-     * approved a RELEASE resolution and the gateway lookup showed no refund under this idempotency key.
+     * approved a RELEASE resolution and the provider has confirmed the refund will not be paid.
      */
     RefundDecision applyReleasedPayout(String approvalId, String approverId, long resolutionId) {
         long startNanos = System.nanoTime();

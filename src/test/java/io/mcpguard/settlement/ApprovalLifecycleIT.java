@@ -673,7 +673,7 @@ class ApprovalLifecycleIT {
                 refund(confirmOrder, "20.00", "FEE_DIFF", "idem-confirm-01")))
                 .isInstanceOf(GuardrailExceptions.PayoutOutcomeUnknownException.class);
         String confirmApprovalId = approvalIdOf(confirmOrder);
-        String providerTxId = paymentGateway.lookupRefund(confirmOrder, "idem-confirm-01").orElseThrow().transactionId();
+        String providerTxId = paymentGateway.lookupRefund(confirmOrder, "idem-confirm-01").refund().transactionId();
 
         mockMvc.perform(post("/api/approvals/{id}/confirm-payout", confirmApprovalId)
                         .header(McpSecurityConfig.HEADER_AGENT_API_KEY, AGENT_KEY)

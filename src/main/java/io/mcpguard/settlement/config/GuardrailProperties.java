@@ -9,7 +9,8 @@ public record GuardrailProperties(
         Mandate mandate,
         Security security,
         Recovery recovery,
-        Demo demo
+        Demo demo,
+        Provider provider
 ) {
     public record Mandate(
             String currency,
@@ -48,6 +49,22 @@ public record GuardrailProperties(
     public record Demo(
             boolean seedEnabled,
             @DefaultValue("true") boolean httpEnabled
+    ) {
+    }
+
+    /**
+     * How frozen payouts may be released, and how often booked payouts are checked against the provider again.
+     *
+     * @param cancelSupported        the provider can void a refund that has not settled
+     * @param settlementWindowHours  when cancel is unavailable, a missing refund may be released only after this long
+     * @param reconcileLookbackDays  booked and released payouts newer than this are compared with the provider
+     * @param reconcileIntervalMs    delay between reconciliation passes
+     */
+    public record Provider(
+            @DefaultValue("true") boolean cancelSupported,
+            @DefaultValue("24") int settlementWindowHours,
+            @DefaultValue("7") int reconcileLookbackDays,
+            @DefaultValue("3600000") long reconcileIntervalMs
     ) {
     }
 }
