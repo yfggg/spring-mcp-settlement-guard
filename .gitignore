@@ -27,8 +27,10 @@ Thumbs.db
 logs/
 *.log
 
-### Local Secrets ###
+### Local Secrets & Private Notes ###
 sk_test.txt
 sk_*.txt
 .env
 .env.*
+local-notes/
+本地备忘_*.md
