@@ -252,9 +252,10 @@ class ApprovalLifecycleIT {
         CountDownLatch ready = new CountDownLatch(threads);
         CountDownLatch start = new CountDownLatch(1);
 
-        // Part A: 10 threads simultaneously request $45.00 on the same order.
+        // Part A: 10 threads simultaneously request $45.00 on the same order, each a distinct refund line.
         // Without SELECT ... FOR UPDATE, all 10 would see $0 used and pay out $450.00.
         // With pessimistic row locking, strictly 4 ($180.00 <= $200.00) execute and 6 pause.
+        // Distinct reason codes keep these from being merged as retries of one in-flight refund.
         List<Future<ApprovalGateService.RefundDecision>> futures = new ArrayList<>();
         for (int i = 0; i < threads; i++) {
             final int idx = i;
@@ -262,7 +263,7 @@ class ApprovalLifecycleIT {
                 ready.countDown();
                 start.await(5, TimeUnit.SECONDS);
                 return approvalGateService.submitRefund(
-                        refund(raceOrderId, "45.00", "CONCURRENT_CLAIM", "idem-race-" + idx));
+                        refund(raceOrderId, "45.00", "CONCURRENT_CLAIM_" + idx, "idem-race-" + idx));
             }));
         }
         ready.await(5, TimeUnit.SECONDS);

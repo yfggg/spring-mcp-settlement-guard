@@ -57,8 +57,7 @@ jobs:
       - name: Run the suite against PostgreSQL 16 (migrations and row locks)
         run: chmod +x mvnw && ./mvnw -B clean verify
         env:
-          SPRING_DATASOURCE_URL: jdbc:postgresql://localhost:5432/mcpguard
+          SPRING_DATASOURCE_URL: jdbc:postgresql://localhost:5432/mcpguard?options=-c%20lock_timeout%3D10s
           SPRING_DATASOURCE_DRIVER_CLASS_NAME: org.postgresql.Driver
           SPRING_DATASOURCE_USERNAME: mcpguard
           SPRING_DATASOURCE_PASSWORD: mcpguard_local
-          SPRING_DATASOURCE_HIKARI_CONNECTION_INIT_SQL: SET lock_timeout = '10s'

@@ -16,20 +16,24 @@ public interface RefundApprovalOrderRepository extends JpaRepository<RefundAppro
 
     Optional<RefundApprovalOrder> findByIdempotencyKey(String idempotencyKey);
 
+    boolean existsByTransactionId(String transactionId);
+
+    /** Same order, amount, currency, and reason, still reserved (pending, executing, or frozen). Oldest first. */
     @Query("""
             SELECT r FROM RefundApprovalOrder r
              WHERE r.orderId = :orderId
                AND r.amount = :amount
                AND r.currency = :currency
                AND r.reasonCode = :reasonCode
-               AND r.status = io.mcpguard.settlement.guardrail.ApprovalStatus.PAYOUT_UNKNOWN
-             ORDER BY r.createdAt DESC
+               AND r.status IN :statuses
+             ORDER BY r.createdAt ASC
             """)
-    List<RefundApprovalOrder> findFrozenDuplicates(
+    List<RefundApprovalOrder> findInFlightDuplicates(
             @Param("orderId") String orderId,
             @Param("amount") BigDecimal amount,
             @Param("currency") String currency,
-            @Param("reasonCode") String reasonCode);
+            @Param("reasonCode") String reasonCode,
+            @Param("statuses") Collection<ApprovalStatus> statuses);
 
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("""

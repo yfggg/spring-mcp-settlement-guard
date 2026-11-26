@@ -20,7 +20,8 @@ import org.hibernate.type.SqlTypes;
         name = "refund_approval_order",
         uniqueConstraints = {
                 @UniqueConstraint(name = "uk_approval_id", columnNames = "approval_id"),
-                @UniqueConstraint(name = "uk_approval_idempotency_key", columnNames = "idempotency_key")
+                @UniqueConstraint(name = "uk_approval_idempotency_key", columnNames = "idempotency_key"),
+                @UniqueConstraint(name = "uk_approval_transaction_id", columnNames = "transaction_id")
         },
         indexes = {
                 @Index(name = "idx_approval_order_window", columnList = "order_id,status,created_at")

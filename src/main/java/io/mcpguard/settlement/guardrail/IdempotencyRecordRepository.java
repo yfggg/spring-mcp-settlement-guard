@@ -21,6 +21,14 @@ public interface IdempotencyRecordRepository extends JpaRepository<IdempotencyRe
 
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("""
+            DELETE FROM IdempotencyRecord r
+             WHERE r.idempotencyKey = :idempotencyKey
+               AND r.state = io.mcpguard.settlement.guardrail.IdempotencyRecord.State.UNKNOWN_SUSPENDED
+            """)
+    int deleteSuspended(@Param("idempotencyKey") String idempotencyKey);
+
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("""
             UPDATE IdempotencyRecord r
                SET r.state = io.mcpguard.settlement.guardrail.IdempotencyRecord.State.COMPLETED,
                    r.responseJson = :responseJson,

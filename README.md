@@ -53,8 +53,8 @@ sequenceDiagram
 
 | Failure Mode in Naive Agents | How `spring-mcp-settlement-guard` Solves It |
 | :--- | :--- |
-| **Duplicate mutations on timeout/retry** | Stripe-style 3-state `IdempotencyKeyStore` (`IN_PROGRESS` / `COMPLETED` / `UNKNOWN_SUSPENDED`) backed by a DB unique constraint in an isolated transaction before side effects run. The fingerprint covers every business field, so reusing a key with any changed field is a `409`. |
-| **Gateway timeout after money may have moved** | The payout is reserved as `EXECUTING` and committed *before* the gateway call, which runs outside any DB transaction. A timeout freezes the request as `PAYOUT_UNKNOWN`: it keeps counting against limits and cannot be approved again. Finance closes it with `POST /api/approvals/{id}/confirm-payout` (money moved; ledger is updated with the gateway transaction id) or `POST /api/approvals/{id}/release-payout` (money did not move; the reservation is released). |
+| **Duplicate mutations on timeout/retry** | Stripe-style 3-state `IdempotencyKeyStore` (`IN_PROGRESS` / `COMPLETED` / `UNKNOWN_SUSPENDED`) backed by a DB unique constraint in an isolated transaction before side effects run. The fingerprint covers every business field, so reusing a key with any changed field is a `409`. If an agent retries under a *new* key while an identical refund (same order, amount, currency, reason) is still pending, executing, or frozen, the request is linked to the existing one instead of reserving and paying again. Once money has moved, the caller always gets the settled result, even if storing the receipt fails. |
+| **Gateway timeout after money may have moved** | The payout is reserved as `EXECUTING` and committed *before* the gateway call, which runs outside any DB transaction. A timeout freezes the request as `PAYOUT_UNKNOWN`: it keeps counting against limits and cannot be approved again. Finance closes it with `POST /api/approvals/{id}/confirm-payout` (money moved; ledger is updated with the gateway transaction id) or `POST /api/approvals/{id}/release-payout` (money did not move; the reservation is released). A provider transaction id can settle only one refund. |
 | **Refunds for unknown orders or over-refunds** | Under the order row lock, the request is rejected unless the order exists and `amount <= captured - already refunded - reserved (pending / executing / unknown)`. |
 | **Split-claim ("smurfing") & race attacks** | `ApprovalGateService` acquires a `SELECT ... FOR UPDATE` per-order lock and sums `EXECUTED`, `EXECUTING`, `PAYOUT_UNKNOWN` and in-flight `PENDING_APPROVAL` amounts across a rolling 24h window (`<= $200.00` default). |
 | **Malformed or injected tool arguments** | Every MCP tool parameter carries Bean Validation constraints (`@Digits`, `@Pattern`, `@Size`); invalid input is rejected before an idempotency slot is claimed or a row lock is taken. |
@@ -107,10 +107,14 @@ spring-mcp-settlement-guard/
     │       └── ToolExecutionAuditLog.java
     ├── main/resources/db/migration/
     │   ├── V1__baseline_schema.sql
-    │   └── V2__payout_release_and_ledger_guards.sql
+    │   ├── V2__payout_release_and_ledger_guards.sql
+    │   └── V3__unique_transaction_id.sql
     └── test/java/io/mcpguard/settlement/
         ├── ApprovalLifecycleIT.java
-        └── DeterministicMockAgentTest.java
+        ├── GuardrailEdgeCaseIT.java
+        ├── DemoEndpointDisabledIT.java
+        ├── DeterministicMockAgentTest.java
+        └── config/GuardrailConfigurationGuardTest.java
 ```
 
 ## Quick Start (3 Minutes)
@@ -157,7 +161,7 @@ Every guardrail, anti-smurfing velocity cap, concurrent race lock, and MCP SSE h
 
 JDK 17 and 21 run that command on H2. CI also runs it once against PostgreSQL 16 so Flyway V1/V2 and `SELECT ... FOR UPDATE` are exercised on the database the row locks are written for.
 
-Key verified scenarios in `ApprovalLifecycleIT` & `DeterministicMockAgentTest`:
+Key verified scenarios in `ApprovalLifecycleIT`, `GuardrailEdgeCaseIT` & `DeterministicMockAgentTest`:
 - Real MCP SSE wire handshake (`initialize` -> `listTools` -> `callTool`) via the official `McpSyncClient`.
 - Malformed tool arguments (`45.005`, `forty five`, `-10.00`, `US Dollars`, SQL fragments) are rejected over the wire with no idempotency row and no payout.
 - Auto-executes low-risk refunds at or below `$50.00` and logs zero-token audit telemetry.
@@ -169,6 +173,12 @@ Key verified scenarios in `ApprovalLifecycleIT` & `DeterministicMockAgentTest`:
 - Never reports a rejection when a concurrent approval won, or after the request expired.
 - Rejects tampered idempotency payloads (`409`), tampered DB snapshots (`422`), expired approvals, and unauthorized self-approval attempts (`401` / `403`).
 - Freezes requests left in flight by a crash via the stale-execution sweeper.
+- Ten concurrent callers on one idempotency key produce exactly one payout.
+- An agent that switches to a new key while the same refund is pending approval or mid-payout is linked to the existing request; the new key later replays the settled result.
+- Partial failures after money moved (audit write, receipt write, ledger update) never surface a payout as failed and never pay twice. Failures are injected with temporary CHECK constraints, so production code runs unmodified.
+- One provider transaction id cannot settle two frozen payouts; concurrent confirm and release on the same payout leave exactly one consistent outcome.
+- Unknown order ids leave no rows behind; a key frozen by a crash before any reservation is recovered on retry.
+- Startup refuses blank keys and the published demo keys outside demo mode; the demo endpoint returns `404` when disabled.
 
 ## Production Notes
 

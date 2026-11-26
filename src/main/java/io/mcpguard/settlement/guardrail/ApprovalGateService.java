@@ -19,10 +19,12 @@ import java.time.Instant;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.regex.Pattern;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
@@ -49,6 +51,9 @@ public class ApprovalGateService {
     public static final String FROZEN_PAYOUT_MESSAGE =
             "Payout is frozen for manual reconciliation. Do not submit a new idempotency key.";
     public static final String EXPIRED_MESSAGE = "Approval request has expired and must be re-submitted";
+    public static final String DUPLICATE_IN_FLIGHT_MESSAGE =
+            "An identical refund for this order is already in progress. Track this approvalId; do not submit it again.";
+    public static final String RULE_IN_FLIGHT_DUPLICATE = "IN_FLIGHT_DUPLICATE_LINKED";
     public static final String RULE_AUTO_UNDER_MANDATE = "AUTO_APPROVED_UNDER_MANDATE";
     public static final String RULE_SINGLE_LIMIT = "SINGLE_LIMIT_EXCEEDED";
     public static final String RULE_ROLLING_24H_VELOCITY = "ROLLING_24H_VELOCITY_EXCEEDED";
@@ -112,6 +117,10 @@ public class ApprovalGateService {
     public RefundDecision submitRefund(RefundCommand rawCommand) {
         long startNanos = System.nanoTime();
         RefundCommand command = validateAndNormalize(rawCommand);
+        return submitNormalized(command, startNanos, true);
+    }
+
+    private RefundDecision submitNormalized(RefundCommand command, long startNanos, boolean allowSuspendedRecovery) {
         String snapshotHash = snapshotHasher.hash(
                 command.orderId(), command.amount(), command.currency(), command.reasonCode());
         String requestFingerprint = computeRequestFingerprint(command);
@@ -125,37 +134,40 @@ public class ApprovalGateService {
             return inProgressDecision(command);
         }
         if (claim.outcome() == IdempotencyKeyStore.ClaimOutcome.SUSPENDED) {
-            return suspendedDecision(command);
+            Optional<RefundApprovalOrder> owned = approvalRepository.findByIdempotencyKey(command.idempotencyKey());
+            if (owned.isPresent()) {
+                return toDecision(owned.get(), messageFor(owned.get().getStatus()));
+            }
+            if (!allowSuspendedRecovery) {
+                throw new GuardrailExceptions.IdempotencyConflictException(
+                        "Idempotency key '" + command.idempotencyKey() + "' is frozen; reconcile it before retrying.");
+            }
+            // No approval row was ever committed under this key, so nothing was reserved and the gateway was never called.
+            if (idempotencyKeyStore.releaseSuspended(command.idempotencyKey())) {
+                log.warn("Released suspended idempotency key {} that never reserved a payout", command.idempotencyKey());
+            }
+            return submitNormalized(command, startNanos, false);
         }
 
         LockedEvaluation eval = null;
-        boolean payoutSettled = false;
         RefundDecision decision = null;
+        boolean outcomeCommitted = false;
         try {
+            // Check existence before creating a lock anchor, so unknown order ids leave no rows behind.
+            if (invoiceRepository.findByOrderId(command.orderId()).isEmpty()) {
+                throw new GuardrailExceptions.InvalidSettlementRequestException(
+                        "Order is not eligible for refund: " + command.orderId());
+            }
             anchorLockService.ensureAnchorExists(command.orderId());
             eval = txTemplate.execute(status -> evaluateUnderOrderLock(command, snapshotHash));
             if (eval == null) {
                 throw new IllegalStateException("Refund evaluation returned no decision");
             }
             decision = eval.decision();
-            if (eval.linksFrozenPayout()) {
-                idempotencyKeyStore.releaseInProgress(command.idempotencyKey());
-                safeAudit(
-                        "issue_customer_refund",
-                        command.orderId(),
-                        decision.approvalId(),
-                        command.amount(),
-                        decision.status(),
-                        "FROZEN_PAYOUT_RETRY",
-                        null,
-                        startNanos);
-                return decision;
-            }
             if (eval.payoutReserved()) {
                 DispatchResult settled = dispatchReservedPayout(
                         decision.approvalId(), command.orderId(), command.amount(), command.currency(),
                         command.idempotencyKey(), null);
-                payoutSettled = true;
                 decision = new RefundDecision(
                         ApprovalStatus.EXECUTED.name(),
                         decision.approvalId(),
@@ -166,6 +178,9 @@ public class ApprovalGateService {
                         "Auto-executed within settlement guardrail policy"
                 );
             }
+            // From here on the outcome is committed in the database: a new hold, a link to an existing
+            // request, or a settled payout. The caller must receive it even if storing the receipt fails.
+            outcomeCommitted = true;
             rememberDecision(command.idempotencyKey(), decision);
             safeAudit(
                     "issue_customer_refund",
@@ -173,7 +188,7 @@ public class ApprovalGateService {
                     decision.approvalId(),
                     command.amount(),
                     decision.status(),
-                    eval.internalRuleCode(),
+                    eval.linksExistingRequest() ? RULE_IN_FLIGHT_DUPLICATE : eval.internalRuleCode(),
                     eval.reviewerMarker(),
                     startNanos);
             return decision;
@@ -186,13 +201,13 @@ public class ApprovalGateService {
                     unknownDiagnostic(decision == null ? null : decision.approvalId()));
             throw unknown;
         } catch (RuntimeException unexpected) {
-            if (eval != null && eval.linksFrozenPayout()) {
-                idempotencyKeyStore.releaseInProgress(command.idempotencyKey());
-            } else if (payoutSettled && decision != null) {
+            if (outcomeCommitted) {
                 rememberQuietly(command.idempotencyKey(), decision);
-            } else if (eval != null && !eval.payoutReserved() && decision != null) {
-                rememberQuietly(command.idempotencyKey(), decision);
-            } else if (eval != null && eval.payoutReserved()) {
+                log.warn("Refund outcome {} for {} is committed but its idempotency receipt was not stored",
+                        decision.status(), decision.approvalId(), unexpected);
+                return decision;
+            }
+            if (eval != null && eval.payoutReserved()) {
                 idempotencyKeyStore.markUnknownSuspended(
                         command.idempotencyKey(),
                         unknownDiagnostic(decision == null ? null : decision.approvalId()));
@@ -344,18 +359,24 @@ public class ApprovalGateService {
         String reviewer = requireReviewer(reviewerId);
         String txId = requireTransactionId(transactionId);
 
-        Resolved resolved = txTemplate.execute(status -> {
-            RefundApprovalOrder order = findOrThrow(approvalId);
-            if (order.getStatus() == ApprovalStatus.EXECUTED) {
-                return new Resolved(toDecision(order, "Already executed"), order, false, null);
-            }
-            if (order.getStatus() != ApprovalStatus.PAYOUT_UNKNOWN) {
-                throw new GuardrailExceptions.ApprovalStateConflictException(
-                        "Payout cannot be confirmed from state: " + order.getStatus());
-            }
-            verifySnapshotIntegrity(order);
-            lockAnchor(order.getOrderId());
-            int settled = approvalRepository.settleUnknownPayout(approvalId, txId, reviewer, Instant.now());
+        Resolved resolved;
+        try {
+            resolved = txTemplate.execute(status -> {
+                RefundApprovalOrder order = findOrThrow(approvalId);
+                if (order.getStatus() == ApprovalStatus.EXECUTED) {
+                    return new Resolved(toDecision(order, "Already executed"), order, false, null);
+                }
+                if (order.getStatus() != ApprovalStatus.PAYOUT_UNKNOWN) {
+                    throw new GuardrailExceptions.ApprovalStateConflictException(
+                            "Payout cannot be confirmed from state: " + order.getStatus());
+                }
+                verifySnapshotIntegrity(order);
+                lockAnchor(order.getOrderId());
+                if (approvalRepository.existsByTransactionId(txId)) {
+                    throw new GuardrailExceptions.ApprovalStateConflictException(
+                            "Transaction id " + txId + " is already recorded on another refund");
+                }
+                int settled = approvalRepository.settleUnknownPayout(approvalId, txId, reviewer, Instant.now());
             if (settled != 1) {
                 RefundApprovalOrder latest = findOrThrow(approvalId);
                 if (latest.getStatus() == ApprovalStatus.EXECUTED) {
@@ -384,7 +405,12 @@ public class ApprovalGateService {
                     latest,
                     true,
                     outboxId);
-        });
+            });
+        } catch (DataIntegrityViolationException duplicateTransactionId) {
+            // Two confirmations on different orders raced with the same provider transaction id.
+            throw new GuardrailExceptions.ApprovalStateConflictException(
+                    "Transaction id " + txId + " is already recorded on another refund");
+        }
 
         idempotencyKeyStore.recordTerminalDecision(resolved.order().getIdempotencyKey(), resolved.decision());
         if (resolved.changed()) {
@@ -532,14 +558,6 @@ public class ApprovalGateService {
                                 + "' is still in progress. Retry with the same idempotency key. Do not create a new one."));
     }
 
-    private RefundDecision suspendedDecision(RefundCommand command) {
-        return approvalRepository.findByIdempotencyKey(command.idempotencyKey())
-                .map(order -> toDecision(order, messageFor(order.getStatus())))
-                .orElseThrow(() -> new GuardrailExceptions.IdempotencyConflictException(
-                        "Idempotency key '" + command.idempotencyKey()
-                                + "' is frozen. Do not create a new key for this refund; reconcile it before retrying."));
-    }
-
     private LoadedStatus loadStatus(String approvalId) {
         RefundApprovalOrder order = findOrThrow(approvalId);
         Instant now = Instant.now();
@@ -599,12 +617,17 @@ public class ApprovalGateService {
                     "Refund currency does not match the order currency for " + command.orderId());
         }
 
-        List<RefundApprovalOrder> frozen = approvalRepository.findFrozenDuplicates(
-                command.orderId(), command.amount(), command.currency(), command.reasonCode());
-        if (!frozen.isEmpty()) {
-            RefundApprovalOrder existing = frozen.get(0);
+        // An identical request that is still pending, executing, or frozen is the same refund retried under a
+        // new key. Point the caller at it instead of reserving and paying a second time.
+        List<RefundApprovalOrder> inFlight = approvalRepository.findInFlightDuplicates(
+                command.orderId(), command.amount(), command.currency(), command.reasonCode(), RESERVED_STATUSES);
+        if (!inFlight.isEmpty()) {
+            RefundApprovalOrder existing = inFlight.get(0);
+            String message = existing.getStatus() == ApprovalStatus.PAYOUT_UNKNOWN
+                    ? FROZEN_PAYOUT_MESSAGE
+                    : DUPLICATE_IN_FLIGHT_MESSAGE;
             return new LockedEvaluation(
-                    toDecision(existing, FROZEN_PAYOUT_MESSAGE),
+                    toDecision(existing, message),
                     false,
                     true,
                     existing.getInternalRuleCode(),
@@ -794,6 +817,7 @@ public class ApprovalGateService {
 
     private static boolean isRefreshableCachedStatus(String status) {
         return ApprovalStatus.PENDING_APPROVAL.name().equals(status)
+                || ApprovalStatus.EXECUTING.name().equals(status)
                 || ApprovalStatus.PAYOUT_UNKNOWN.name().equals(status);
     }
 
@@ -942,7 +966,7 @@ public class ApprovalGateService {
     private record LockedEvaluation(
             RefundDecision decision,
             boolean payoutReserved,
-            boolean linksFrozenPayout,
+            boolean linksExistingRequest,
             String internalRuleCode,
             String reviewerMarker
     ) {

@@ -98,6 +98,15 @@ public class IdempotencyKeyStore {
         requiresNewTx.executeWithoutResult(status -> repository.deleteInProgress(idempotencyKey));
     }
 
+    /**
+     * Drops a suspended key. Callers must first confirm that no approval row exists under this key,
+     * which means nothing was reserved and the gateway was never called.
+     */
+    public boolean releaseSuspended(String idempotencyKey) {
+        Integer deleted = requiresNewTx.execute(status -> repository.deleteSuspended(idempotencyKey));
+        return deleted != null && deleted == 1;
+    }
+
     /** Freezes keys whose owning request never finished (for example after a process crash). */
     public int suspendStaleInProgress(Instant cutoff, Instant now) {
         Integer updated = requiresNewTx.execute(status -> repository.suspendStaleInProgress(
