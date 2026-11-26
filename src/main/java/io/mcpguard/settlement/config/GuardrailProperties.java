@@ -19,20 +19,29 @@ public record GuardrailProperties(
     ) {
     }
 
+    /**
+     * @param agentApiKey       shared secret for MCP agent callers
+     * @param reviewerJwtSecret HS256 secret that signs finance reviewer tokens (at least 32 bytes)
+     * @param reviewerJwtIssuer required {@code iss} claim on reviewer tokens
+     * @param snapshotHmacKey   key for the HMAC over paused refund snapshots
+     */
     public record Security(
             String agentApiKey,
-            String reviewerApiKey,
+            String reviewerJwtSecret,
+            @DefaultValue("spring-mcp-settlement-guard") String reviewerJwtIssuer,
             @DefaultValue("mcp-demo-snapshot-hmac-2026") String snapshotHmacKey
     ) {
     }
 
     /**
      * Requests stuck in IN_PROGRESS / EXECUTING longer than {@code staleAfterMinutes} (for example after a crash)
-     * are frozen as UNKNOWN_SUSPENDED / PAYOUT_UNKNOWN for manual reconciliation.
+     * are frozen as UNKNOWN_SUSPENDED / PAYOUT_UNKNOWN for manual reconciliation. Approval events left unpublished
+     * for longer than {@code outboxGraceSeconds} are delivered again.
      */
     public record Recovery(
             int staleAfterMinutes,
-            long sweepIntervalMs
+            long sweepIntervalMs,
+            @DefaultValue("30") int outboxGraceSeconds
     ) {
     }
 

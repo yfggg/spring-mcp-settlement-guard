@@ -84,6 +84,7 @@ public class ApprovalGateService {
     private final ApprovalWebhookNotifier webhookNotifier;
     private final ToolExecutionAuditLog auditLog;
     private final SnapshotHasher snapshotHasher;
+    private final PayoutResolutionRepository resolutionRepository;
     private final TransactionTemplate txTemplate;
     private final TransactionTemplate requiresNewTx;
 
@@ -98,6 +99,7 @@ public class ApprovalGateService {
             ApprovalWebhookNotifier webhookNotifier,
             ToolExecutionAuditLog auditLog,
             SnapshotHasher snapshotHasher,
+            PayoutResolutionRepository resolutionRepository,
             PlatformTransactionManager transactionManager) {
         this.properties = properties;
         this.idempotencyKeyStore = idempotencyKeyStore;
@@ -109,6 +111,7 @@ public class ApprovalGateService {
         this.webhookNotifier = webhookNotifier;
         this.auditLog = auditLog;
         this.snapshotHasher = snapshotHasher;
+        this.resolutionRepository = resolutionRepository;
         this.txTemplate = new TransactionTemplate(transactionManager);
         this.requiresNewTx = new TransactionTemplate(transactionManager);
         this.requiresNewTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
@@ -134,7 +137,7 @@ public class ApprovalGateService {
             return inProgressDecision(command);
         }
         if (claim.outcome() == IdempotencyKeyStore.ClaimOutcome.SUSPENDED) {
-            Optional<RefundApprovalOrder> owned = approvalRepository.findByIdempotencyKey(command.idempotencyKey());
+            Optional<RefundApprovalOrder> owned = ownedOrLinkedApproval(command.idempotencyKey());
             if (owned.isPresent()) {
                 return toDecision(owned.get(), messageFor(owned.get().getStatus()));
             }
@@ -142,7 +145,7 @@ public class ApprovalGateService {
                 throw new GuardrailExceptions.IdempotencyConflictException(
                         "Idempotency key '" + command.idempotencyKey() + "' is frozen; reconcile it before retrying.");
             }
-            // No approval row was ever committed under this key, so nothing was reserved and the gateway was never called.
+            // No approval belongs or is linked to this key, so nothing was reserved and the gateway was never called.
             if (idempotencyKeyStore.releaseSuspended(command.idempotencyKey())) {
                 log.warn("Released suspended idempotency key {} that never reserved a payout", command.idempotencyKey());
             }
@@ -221,11 +224,13 @@ public class ApprovalGateService {
     public RefundDecision approve(String approvalId, String reviewerId) {
         long startNanos = System.nanoTime();
         String reviewer = requireReviewer(reviewerId);
+        // Persist an overdue expiry before the claim transaction opens, so it never holds two pool connections.
+        expireBeforeClaim(approvalId);
 
         ApprovalClaim claim = txTemplate.execute(status -> {
             RefundApprovalOrder order = findOrThrow(approvalId);
             Instant now = Instant.now();
-            expireIfOverdue(order, now);
+            rejectIfOverdue(order, now);
 
             if (order.getStatus() == ApprovalStatus.EXECUTED) {
                 return new ApprovalClaim(order, false, null);
@@ -293,11 +298,13 @@ public class ApprovalGateService {
     public RefundDecision reject(String approvalId, String reviewerId) {
         long startNanos = System.nanoTime();
         String reviewer = requireReviewer(reviewerId);
+        // Persist an overdue expiry before the claim transaction opens, so it never holds two pool connections.
+        expireBeforeClaim(approvalId);
 
         ApprovalClaim claim = txTemplate.execute(status -> {
             RefundApprovalOrder order = findOrThrow(approvalId);
             Instant now = Instant.now();
-            expireIfOverdue(order, now);
+            rejectIfOverdue(order, now);
 
             if (order.getStatus() == ApprovalStatus.REJECTED) {
                 return new ApprovalClaim(order, false, null);
@@ -351,12 +358,13 @@ public class ApprovalGateService {
     }
 
     /**
-     * Records a gateway transaction id for a payout already frozen as {@code PAYOUT_UNKNOWN}.
-     * Does not call the gateway again.
+     * Books a frozen payout as settled. Called only by {@link PayoutResolutionService} after a second reviewer
+     * approved a CONFIRM resolution and the gateway lookup matched. Never calls the gateway refund endpoint.
+     * The resolution is closed in the same transaction as the status change.
      */
-    public RefundDecision confirmSettledPayout(String approvalId, String reviewerId, String transactionId) {
+    RefundDecision applyConfirmedPayout(String approvalId, String approverId, String transactionId, long resolutionId) {
         long startNanos = System.nanoTime();
-        String reviewer = requireReviewer(reviewerId);
+        String reviewer = requireReviewer(approverId);
         String txId = requireTransactionId(transactionId);
 
         Resolved resolved;
@@ -376,35 +384,37 @@ public class ApprovalGateService {
                     throw new GuardrailExceptions.ApprovalStateConflictException(
                             "Transaction id " + txId + " is already recorded on another refund");
                 }
-                int settled = approvalRepository.settleUnknownPayout(approvalId, txId, reviewer, Instant.now());
-            if (settled != 1) {
-                RefundApprovalOrder latest = findOrThrow(approvalId);
-                if (latest.getStatus() == ApprovalStatus.EXECUTED) {
-                    return new Resolved(toDecision(latest, "Already executed"), latest, false, null);
+                Instant now = Instant.now();
+                int settled = approvalRepository.settleUnknownPayout(approvalId, txId, reviewer, now);
+                if (settled != 1) {
+                    RefundApprovalOrder latest = findOrThrow(approvalId);
+                    if (latest.getStatus() == ApprovalStatus.EXECUTED) {
+                        return new Resolved(toDecision(latest, "Already executed"), latest, false, null);
+                    }
+                    throw new GuardrailExceptions.ApprovalStateConflictException(
+                            "Concurrent state change prevented payout confirmation: " + latest.getStatus());
                 }
-                throw new GuardrailExceptions.ApprovalStateConflictException(
-                        "Concurrent state change prevented payout confirmation: " + latest.getStatus());
-            }
-            int updated = invoiceRepository.incrementRefundedAmount(order.getOrderId(), order.getAmount());
-            if (updated != 1) {
-                throw new GuardrailExceptions.ApprovalStateConflictException(
-                        "Settled amount exceeds the remaining captured balance for " + order.getOrderId());
-            }
-            RefundApprovalOrder latest = findOrThrow(approvalId);
-            Long outboxId = webhookNotifier.stage(new ApprovalWebhookNotifier.ApprovalDecisionEvent(
-                    latest.getApprovalId(),
-                    latest.getOrderId(),
-                    latest.getAmount(),
-                    latest.getCurrency(),
-                    ApprovalStatus.EXECUTED,
-                    latest.getTransactionId(),
-                    reviewer,
-                    Instant.now()));
-            return new Resolved(
-                    toDecision(latest, "Settled after manual gateway reconciliation"),
-                    latest,
-                    true,
-                    outboxId);
+                int updated = invoiceRepository.incrementRefundedAmount(order.getOrderId(), order.getAmount());
+                if (updated != 1) {
+                    throw new GuardrailExceptions.ApprovalStateConflictException(
+                            "Settled amount exceeds the remaining captured balance for " + order.getOrderId());
+                }
+                closeResolution(resolutionId, reviewer, now);
+                RefundApprovalOrder latest = findOrThrow(approvalId);
+                Long outboxId = webhookNotifier.stage(new ApprovalWebhookNotifier.ApprovalDecisionEvent(
+                        latest.getApprovalId(),
+                        latest.getOrderId(),
+                        latest.getAmount(),
+                        latest.getCurrency(),
+                        ApprovalStatus.EXECUTED,
+                        latest.getTransactionId(),
+                        reviewer,
+                        now));
+                return new Resolved(
+                        toDecision(latest, "Settled after manual gateway reconciliation"),
+                        latest,
+                        true,
+                        outboxId);
             });
         } catch (DataIntegrityViolationException duplicateTransactionId) {
             // Two confirmations on different orders raced with the same provider transaction id.
@@ -420,7 +430,7 @@ public class ApprovalGateService {
                     resolved.order().getApprovalId(),
                     resolved.order().getAmount(),
                     ApprovalStatus.EXECUTED.name(),
-                    "HUMAN_CONFIRMED_GATEWAY_SETTLEMENT",
+                    "FOUR_EYES_CONFIRMED_GATEWAY_SETTLEMENT",
                     reviewer,
                     startNanos);
             webhookNotifier.publishStaged(resolved.outboxId());
@@ -429,11 +439,12 @@ public class ApprovalGateService {
     }
 
     /**
-     * Drops a frozen reservation after finance confirms the gateway did not move money.
+     * Releases a frozen reservation. Called only by {@link PayoutResolutionService} after a second reviewer
+     * approved a RELEASE resolution and the gateway lookup showed no refund under this idempotency key.
      */
-    public RefundDecision releaseUnknownPayout(String approvalId, String reviewerId) {
+    RefundDecision applyReleasedPayout(String approvalId, String approverId, long resolutionId) {
         long startNanos = System.nanoTime();
-        String reviewer = requireReviewer(reviewerId);
+        String reviewer = requireReviewer(approverId);
 
         Resolved resolved = txTemplate.execute(status -> {
             RefundApprovalOrder order = findOrThrow(approvalId);
@@ -446,7 +457,8 @@ public class ApprovalGateService {
             }
             verifySnapshotIntegrity(order);
             lockAnchor(order.getOrderId());
-            int updated = approvalRepository.releaseUnknownPayout(approvalId, reviewer, Instant.now());
+            Instant now = Instant.now();
+            int updated = approvalRepository.releaseUnknownPayout(approvalId, reviewer, now);
             RefundApprovalOrder latest = findOrThrow(approvalId);
             if (updated != 1) {
                 if (latest.getStatus() == ApprovalStatus.PAYOUT_RELEASED) {
@@ -455,6 +467,7 @@ public class ApprovalGateService {
                 throw new GuardrailExceptions.ApprovalStateConflictException(
                         "Concurrent state change prevented payout release: " + latest.getStatus());
             }
+            closeResolution(resolutionId, reviewer, now);
             Long outboxId = webhookNotifier.stage(new ApprovalWebhookNotifier.ApprovalDecisionEvent(
                     latest.getApprovalId(),
                     latest.getOrderId(),
@@ -463,7 +476,7 @@ public class ApprovalGateService {
                     ApprovalStatus.PAYOUT_RELEASED,
                     null,
                     reviewer,
-                    Instant.now()));
+                    now));
             return new Resolved(
                     toDecision(latest, "Released after confirming the gateway did not move money"),
                     latest,
@@ -479,7 +492,7 @@ public class ApprovalGateService {
                     resolved.order().getApprovalId(),
                     resolved.order().getAmount(),
                     ApprovalStatus.PAYOUT_RELEASED.name(),
-                    "HUMAN_CONFIRMED_NO_PAYOUT",
+                    "FOUR_EYES_CONFIRMED_NO_PAYOUT",
                     reviewer,
                     startNanos);
             webhookNotifier.publishStaged(resolved.outboxId());
@@ -551,7 +564,7 @@ public class ApprovalGateService {
     }
 
     private RefundDecision inProgressDecision(RefundCommand command) {
-        return approvalRepository.findByIdempotencyKey(command.idempotencyKey())
+        return ownedOrLinkedApproval(command.idempotencyKey())
                 .map(order -> toDecision(order, REUSE_KEY_MESSAGE))
                 .orElseThrow(() -> new GuardrailExceptions.IdempotencyInProgressException(
                         "Request with idempotency key '" + command.idempotencyKey()
@@ -623,6 +636,8 @@ public class ApprovalGateService {
                 command.orderId(), command.amount(), command.currency(), command.reasonCode(), RESERVED_STATUSES);
         if (!inFlight.isEmpty()) {
             RefundApprovalOrder existing = inFlight.get(0);
+            // Record the link with the evaluation, so recovery can find it even if the receipt is never written.
+            idempotencyKeyStore.linkToApproval(command.idempotencyKey(), existing.getApprovalId());
             String message = existing.getStatus() == ApprovalStatus.PAYOUT_UNKNOWN
                     ? FROZEN_PAYOUT_MESSAGE
                     : DUPLICATE_IN_FLIGHT_MESSAGE;
@@ -746,6 +761,34 @@ public class ApprovalGateService {
         }
     }
 
+    /** The approval created under this key, or the in-flight approval this key was linked to. */
+    private Optional<RefundApprovalOrder> ownedOrLinkedApproval(String idempotencyKey) {
+        Optional<RefundApprovalOrder> owned = approvalRepository.findByIdempotencyKey(idempotencyKey);
+        if (owned.isPresent()) {
+            return owned;
+        }
+        return idempotencyKeyStore.linkedApprovalId(idempotencyKey).flatMap(approvalRepository::findByApprovalId);
+    }
+
+    private void expireBeforeClaim(String approvalId) {
+        expireIfOverdue(findOrThrow(approvalId), Instant.now());
+    }
+
+    /** In-transaction guard for the rare case where the deadline passes between the pre-check and the claim. */
+    private static void rejectIfOverdue(RefundApprovalOrder order, Instant now) {
+        if (order.getStatus() == ApprovalStatus.PENDING_APPROVAL && !order.getExpiresAt().isAfter(now)) {
+            throw new GuardrailExceptions.ApprovalStateConflictException(
+                    "Approval request has expired and must be re-submitted: " + order.getApprovalId());
+        }
+    }
+
+    private void closeResolution(long resolutionId, String reviewer, Instant now) {
+        int closed = resolutionRepository.closeProposal(resolutionId, PayoutResolution.Status.APPLIED, reviewer, now);
+        if (closed != 1) {
+            throw new GuardrailExceptions.ApprovalStateConflictException("Payout resolution is no longer awaiting review");
+        }
+    }
+
     private void freezeUnknown(String approvalId) {
         requiresNewTx.executeWithoutResult(status -> approvalRepository.markPayoutUnknown(approvalId));
     }
@@ -821,14 +864,14 @@ public class ApprovalGateService {
                 || ApprovalStatus.PAYOUT_UNKNOWN.name().equals(status);
     }
 
-    private static String requireReviewer(String reviewerId) {
+    static String requireReviewer(String reviewerId) {
         if (!StringUtils.hasText(reviewerId)) {
             throw new GuardrailExceptions.InvalidSettlementRequestException("Missing reviewer identity");
         }
         return reviewerId.trim();
     }
 
-    private static String requireTransactionId(String transactionId) {
+    static String requireTransactionId(String transactionId) {
         if (!StringUtils.hasText(transactionId) || !TRANSACTION_ID.matcher(transactionId.trim()).matches()) {
             throw new GuardrailExceptions.InvalidSettlementRequestException(
                     "transactionId must be 1-64 characters of letters, digits, '.', '_', ':' or '-'");

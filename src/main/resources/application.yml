@@ -39,11 +39,13 @@ guardrail:
     approval-ttl-hours: 24
   security:
     agent-api-key: ${MCP_AGENT_API_KEY:mcp-demo-agent-key-2026}
-    reviewer-api-key: ${MCP_REVIEWER_API_KEY:mcp-demo-reviewer-key-2026}
+    reviewer-jwt-secret: ${MCP_REVIEWER_JWT_SECRET:mcp-demo-reviewer-jwt-secret-2026-replace-me}
+    reviewer-jwt-issuer: ${MCP_REVIEWER_JWT_ISSUER:spring-mcp-settlement-guard}
     snapshot-hmac-key: ${MCP_SNAPSHOT_HMAC_KEY:mcp-demo-snapshot-hmac-2026}
   recovery:
     stale-after-minutes: 15
     sweep-interval-ms: 60000
+    outbox-grace-seconds: 30
   demo:
     seed-enabled: true
     http-enabled: true

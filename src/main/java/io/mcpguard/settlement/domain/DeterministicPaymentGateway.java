@@ -3,11 +3,14 @@ package io.mcpguard.settlement.domain;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.springframework.stereotype.Component;
@@ -15,14 +18,23 @@ import org.springframework.stereotype.Component;
 /**
  * Deterministic sandbox payment adapter with thread-safe per-order execution counters
  * so CI tests can assert at-most-once execution without external API credentials.
- * Supports injected gateway timeouts to exercise the PAYOUT_UNKNOWN path.
+ *
+ * <p>Failure modes for the {@code PAYOUT_UNKNOWN} path:
+ * <ul>
+ *   <li>{@link #simulateTimeoutForOrder}: the request never reaches the provider; no money moves.</li>
+ *   <li>{@link #simulateTimeoutAfterSettlementForOrder}: the provider pays, then the response is lost.</li>
+ *   <li>{@link #simulateLookupOutage}: refund lookups fail, as during a provider outage.</li>
+ * </ul>
  */
 @Component
 public class DeterministicPaymentGateway implements PaymentGatewayPort {
 
     private final ConcurrentHashMap<String, AtomicInteger> orderExecutionCounts = new ConcurrentHashMap<>();
+    private final Map<String, PaymentExecutionResult> refundsByReference = new ConcurrentHashMap<>();
     private final AtomicInteger totalExecutions = new AtomicInteger(0);
     private final Set<String> timeoutOrders = ConcurrentHashMap.newKeySet();
+    private final Set<String> timeoutAfterSettlementOrders = ConcurrentHashMap.newKeySet();
+    private final AtomicBoolean lookupOutage = new AtomicBoolean(false);
     private final AtomicReference<ExecutionPause> executionPause = new AtomicReference<>();
 
     @Override
@@ -35,20 +47,41 @@ public class DeterministicPaymentGateway implements PaymentGatewayPort {
             throw new GatewayTimeoutException("Simulated gateway read timeout for order " + orderId);
         }
         awaitPauseIfArmed();
+        // Count every call that reaches the provider, including deduplicated repeats, so tests can assert
+        // that the guardrail itself never dispatches the same payout twice.
         totalExecutions.incrementAndGet();
         orderExecutionCounts.computeIfAbsent(orderId, k -> new AtomicInteger(0)).incrementAndGet();
+        String reference = reference(orderId, idempotencyRef);
+        PaymentExecutionResult existing = refundsByReference.get(reference);
+        if (existing != null) {
+            // Providers deduplicate on the idempotency reference; a repeat returns the original refund.
+            return existing;
+        }
 
-        String suffix = UUID.nameUUIDFromBytes((orderId + ":" + idempotencyRef).getBytes(StandardCharsets.UTF_8))
+        String suffix = UUID.nameUUIDFromBytes(reference.getBytes(StandardCharsets.UTF_8))
                 .toString()
                 .replace("-", "")
                 .substring(0, 10);
-        return new PaymentExecutionResult(
+        PaymentExecutionResult result = new PaymentExecutionResult(
                 "tx_" + suffix,
                 orderId,
                 DeterministicReconciler.scale(amount),
                 currency,
                 Instant.now()
         );
+        refundsByReference.put(reference, result);
+        if (timeoutAfterSettlementOrders.contains(orderId)) {
+            throw new GatewayTimeoutException("Simulated response loss after settlement for order " + orderId);
+        }
+        return result;
+    }
+
+    @Override
+    public Optional<PaymentExecutionResult> lookupRefund(String orderId, String idempotencyRef) {
+        if (lookupOutage.get()) {
+            throw new GatewayTimeoutException("Simulated gateway lookup outage");
+        }
+        return Optional.ofNullable(refundsByReference.get(reference(orderId, idempotencyRef)));
     }
 
     public int getExecutionCountForOrder(String orderId) {
@@ -64,8 +97,17 @@ public class DeterministicPaymentGateway implements PaymentGatewayPort {
         timeoutOrders.add(orderId);
     }
 
+    public void simulateTimeoutAfterSettlementForOrder(String orderId) {
+        timeoutAfterSettlementOrders.add(orderId);
+    }
+
     public void clearTimeoutForOrder(String orderId) {
         timeoutOrders.remove(orderId);
+        timeoutAfterSettlementOrders.remove(orderId);
+    }
+
+    public void simulateLookupOutage(boolean outage) {
+        lookupOutage.set(outage);
     }
 
     /**
@@ -76,11 +118,18 @@ public class DeterministicPaymentGateway implements PaymentGatewayPort {
         executionPause.set(new ExecutionPause(entered, release));
     }
 
+    /** Clears counters and failure modes. Recorded refunds stay, as they would at a real provider. */
     public void resetCounters() {
         orderExecutionCounts.clear();
         totalExecutions.set(0);
         timeoutOrders.clear();
+        timeoutAfterSettlementOrders.clear();
+        lookupOutage.set(false);
         executionPause.set(null);
+    }
+
+    private static String reference(String orderId, String idempotencyRef) {
+        return orderId + ":" + idempotencyRef;
     }
 
     private void awaitPauseIfArmed() {

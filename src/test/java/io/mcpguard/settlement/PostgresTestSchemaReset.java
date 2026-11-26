@@ -32,6 +32,7 @@ public class PostgresTestSchemaReset implements ApplicationRunner {
         jdbcTemplate.execute("""
                 TRUNCATE TABLE
                     approval_event_outbox,
+                    payout_resolution,
                     refund_approval_order,
                     idempotency_record,
                     tool_execution_audit_log,

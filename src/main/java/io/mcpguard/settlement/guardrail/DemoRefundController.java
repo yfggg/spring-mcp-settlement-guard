@@ -40,10 +40,20 @@ public class DemoRefundController {
                         request.idempotencyKey()
                 )
         );
-        HttpStatus status = ApprovalStatus.PENDING_APPROVAL.name().equals(decision.status())
-                ? HttpStatus.ACCEPTED
-                : HttpStatus.OK;
-        return ResponseEntity.status(status).body(decision);
+        return ResponseEntity.status(httpStatusFor(decision.status())).body(decision);
+    }
+
+    /**
+     * The HTTP status reflects whether money has moved, so a client that reads only the status code
+     * never mistakes a pending or uncertain refund for a completed one.
+     */
+    static HttpStatus httpStatusFor(String decisionStatus) {
+        return switch (ApprovalStatus.valueOf(decisionStatus)) {
+            case EXECUTED -> HttpStatus.OK;
+            case PENDING_APPROVAL, EXECUTING -> HttpStatus.ACCEPTED;
+            case PAYOUT_UNKNOWN -> HttpStatus.BAD_GATEWAY;
+            case REJECTED, EXPIRED, PAYOUT_RELEASED -> HttpStatus.CONFLICT;
+        };
     }
 
     public record SimulateRefundHttpRequest(

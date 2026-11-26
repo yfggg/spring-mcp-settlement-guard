@@ -46,6 +46,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
@@ -58,8 +59,8 @@ import org.springframework.test.web.servlet.MvcResult;
 class ApprovalLifecycleIT {
 
     private static final String AGENT_KEY = "test-agent-key";
-    private static final String REVIEWER_KEY = "test-reviewer-key";
     private static final String REVIEWER_EMAIL = "finance-lead@company.com";
+    private static final String SECOND_REVIEWER = "controller@company.com";
 
     @Autowired
     private MockMvc mockMvc;
@@ -170,8 +171,7 @@ class ApprovalLifecycleIT {
         assertThat(paused.message()).doesNotContain("50").doesNotContain("200");
 
         mockMvc.perform(get("/api/approvals/{id}", paused.approvalId())
-                        .header(McpSecurityConfig.HEADER_REVIEWER_KEY, REVIEWER_KEY)
-                        .header(McpSecurityConfig.HEADER_REVIEWER_ID, REVIEWER_EMAIL))
+                        .header(HttpHeaders.AUTHORIZATION, ReviewerTokens.bearer(REVIEWER_EMAIL)))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.reasonCode").value("DUPLICATE_CHARGE"))
                 .andExpect(jsonPath("$.internalRuleCode").value(ApprovalGateService.RULE_SINGLE_LIMIT))
@@ -179,8 +179,7 @@ class ApprovalLifecycleIT {
                 .andExpect(jsonPath("$.refundableAmount").value(120.0));
 
         MvcResult approvedRes = mockMvc.perform(post("/api/approvals/{id}/approve", paused.approvalId())
-                        .header(McpSecurityConfig.HEADER_REVIEWER_KEY, REVIEWER_KEY)
-                        .header(McpSecurityConfig.HEADER_REVIEWER_ID, REVIEWER_EMAIL))
+                        .header(HttpHeaders.AUTHORIZATION, ReviewerTokens.bearer(REVIEWER_EMAIL)))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("EXECUTED"))
                 .andExpect(jsonPath("$.refundTxId").isNotEmpty())
@@ -233,8 +232,7 @@ class ApprovalLifecycleIT {
 
         // Rejecting the 5th claim releases its $45 in-flight reservation so a $20 micro-refund ($180 + $20 <= $200) succeeds
         mockMvc.perform(post("/api/approvals/{id}/reject", fifth.approvalId())
-                        .header(McpSecurityConfig.HEADER_REVIEWER_KEY, REVIEWER_KEY)
-                        .header(McpSecurityConfig.HEADER_REVIEWER_ID, REVIEWER_EMAIL))
+                        .header(HttpHeaders.AUTHORIZATION, ReviewerTokens.bearer(REVIEWER_EMAIL)))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("REJECTED"));
 
@@ -365,8 +363,7 @@ class ApprovalLifecycleIT {
                 paused.approvalId());
 
         mockMvc.perform(post("/api/approvals/{id}/approve", paused.approvalId())
-                        .header(McpSecurityConfig.HEADER_REVIEWER_KEY, REVIEWER_KEY)
-                        .header(McpSecurityConfig.HEADER_REVIEWER_ID, REVIEWER_EMAIL))
+                        .header(HttpHeaders.AUTHORIZATION, ReviewerTokens.bearer(REVIEWER_EMAIL)))
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.error").value("SNAPSHOT_INTEGRITY_VIOLATION"));
 
@@ -375,8 +372,7 @@ class ApprovalLifecycleIT {
                 unsignedSha256(orderId + "|999.00|USD|DISPUTE"),
                 paused.approvalId());
         mockMvc.perform(post("/api/approvals/{id}/approve", paused.approvalId())
-                        .header(McpSecurityConfig.HEADER_REVIEWER_KEY, REVIEWER_KEY)
-                        .header(McpSecurityConfig.HEADER_REVIEWER_ID, REVIEWER_EMAIL))
+                        .header(HttpHeaders.AUTHORIZATION, ReviewerTokens.bearer(REVIEWER_EMAIL)))
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.error").value("SNAPSHOT_INTEGRITY_VIOLATION"));
 
@@ -455,8 +451,7 @@ class ApprovalLifecycleIT {
         paymentGateway.simulateTimeoutForOrder(approveOrder);
 
         mockMvc.perform(post("/api/approvals/{id}/approve", paused.approvalId())
-                        .header(McpSecurityConfig.HEADER_REVIEWER_KEY, REVIEWER_KEY)
-                        .header(McpSecurityConfig.HEADER_REVIEWER_ID, REVIEWER_EMAIL))
+                        .header(HttpHeaders.AUTHORIZATION, ReviewerTokens.bearer(REVIEWER_EMAIL)))
                 .andExpect(status().isBadGateway())
                 .andExpect(jsonPath("$.error").value("PAYOUT_OUTCOME_UNKNOWN"));
 
@@ -464,8 +459,7 @@ class ApprovalLifecycleIT {
                 .isEqualTo(ApprovalStatus.PAYOUT_UNKNOWN);
 
         mockMvc.perform(post("/api/approvals/{id}/approve", paused.approvalId())
-                        .header(McpSecurityConfig.HEADER_REVIEWER_KEY, REVIEWER_KEY)
-                        .header(McpSecurityConfig.HEADER_REVIEWER_ID, REVIEWER_EMAIL))
+                        .header(HttpHeaders.AUTHORIZATION, ReviewerTokens.bearer(REVIEWER_EMAIL)))
                 .andExpect(status().isConflict());
 
         ApprovalGateService.RefundDecision frozenAfterApprove = approvalGateService.submitRefund(
@@ -486,8 +480,7 @@ class ApprovalLifecycleIT {
         approvalGateService.approve(approvedFirst.approvalId(), REVIEWER_EMAIL);
 
         mockMvc.perform(post("/api/approvals/{id}/reject", approvedFirst.approvalId())
-                        .header(McpSecurityConfig.HEADER_REVIEWER_KEY, REVIEWER_KEY)
-                        .header(McpSecurityConfig.HEADER_REVIEWER_ID, "second-reviewer@company.com"))
+                        .header(HttpHeaders.AUTHORIZATION, ReviewerTokens.bearer("second-reviewer@company.com")))
                 .andExpect(status().isConflict());
 
         // Expired request -> reject is a 409, status becomes EXPIRED
@@ -498,8 +491,7 @@ class ApprovalLifecycleIT {
                 expiring.approvalId());
 
         mockMvc.perform(post("/api/approvals/{id}/reject", expiring.approvalId())
-                        .header(McpSecurityConfig.HEADER_REVIEWER_KEY, REVIEWER_KEY)
-                        .header(McpSecurityConfig.HEADER_REVIEWER_ID, REVIEWER_EMAIL))
+                        .header(HttpHeaders.AUTHORIZATION, ReviewerTokens.bearer(REVIEWER_EMAIL)))
                 .andExpect(status().isConflict());
         assertThat(approvalRepository.findByApprovalId(expiring.approvalId()).orElseThrow().getStatus())
                 .isEqualTo(ApprovalStatus.EXPIRED);
@@ -533,18 +525,22 @@ class ApprovalLifecycleIT {
 
         mockMvc.perform(post("/api/approvals/{id}/approve", paused.approvalId())
                         .header(McpSecurityConfig.HEADER_AGENT_API_KEY, AGENT_KEY)
-                        .header(McpSecurityConfig.HEADER_REVIEWER_ID, "rogue-agent@bot.local"))
+                        .header("X-Reviewer-Id", "rogue-agent@bot.local"))
                 .andExpect(status().isForbidden());
 
-        // 3. Reviewer key without a reviewer identity is not authenticated -> 401
+        // 3. A reviewer header without a token, or an expired token, is not authenticated -> 401
         mockMvc.perform(post("/api/approvals/{id}/approve", paused.approvalId())
-                        .header(McpSecurityConfig.HEADER_REVIEWER_KEY, REVIEWER_KEY))
+                        .header("X-Reviewer-Id", REVIEWER_EMAIL))
+                .andExpect(status().isUnauthorized());
+        mockMvc.perform(post("/api/approvals/{id}/approve", paused.approvalId())
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + ReviewerTokens.mint(
+                                ReviewerTokens.TEST_SECRET, ReviewerTokens.ISSUER, REVIEWER_EMAIL,
+                                ReviewerTokens.FINANCE_ROLE, Duration.ofMinutes(-5))))
                 .andExpect(status().isUnauthorized());
 
-        // 4. Roles come from the matched secret only: a reviewer cannot act as an agent, whatever headers it sends
+        // 4. Roles come from the verified credential only: a reviewer token cannot act as an agent, whatever headers it sends
         mockMvc.perform(post("/api/demo/simulate-agent-refund")
-                        .header(McpSecurityConfig.HEADER_REVIEWER_KEY, REVIEWER_KEY)
-                        .header(McpSecurityConfig.HEADER_REVIEWER_ID, REVIEWER_EMAIL)
+                        .header(HttpHeaders.AUTHORIZATION, ReviewerTokens.bearer(REVIEWER_EMAIL))
                         .header("X-Reviewer-Role", "MCP_AGENT")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(Map.of(
@@ -561,8 +557,7 @@ class ApprovalLifecycleIT {
                 paused.approvalId());
 
         mockMvc.perform(post("/api/approvals/{id}/approve", paused.approvalId())
-                        .header(McpSecurityConfig.HEADER_REVIEWER_KEY, REVIEWER_KEY)
-                        .header(McpSecurityConfig.HEADER_REVIEWER_ID, REVIEWER_EMAIL))
+                        .header(HttpHeaders.AUTHORIZATION, ReviewerTokens.bearer(REVIEWER_EMAIL)))
                 .andExpect(status().isConflict());
 
         assertThat(approvalRepository.findByApprovalId(paused.approvalId()).orElseThrow().getStatus())
@@ -670,49 +665,83 @@ class ApprovalLifecycleIT {
     }
 
     @Test
-    void financeCanConfirmOrReleaseAFrozenPayout() throws Exception {
+    void frozenPayoutNeedsTwoReviewersAndAMatchingGatewayRecord() throws Exception {
+        // Confirm path: the provider paid, but its response was lost
         String confirmOrder = "ORD-CONFIRM-01";
-        paymentGateway.simulateTimeoutForOrder(confirmOrder);
+        paymentGateway.simulateTimeoutAfterSettlementForOrder(confirmOrder);
         assertThatThrownBy(() -> approvalGateService.submitRefund(
                 refund(confirmOrder, "20.00", "FEE_DIFF", "idem-confirm-01")))
                 .isInstanceOf(GuardrailExceptions.PayoutOutcomeUnknownException.class);
-        String confirmApprovalId = jdbcTemplate.queryForObject(
-                "SELECT approval_id FROM refund_approval_order WHERE order_id = ?",
-                String.class,
-                confirmOrder);
+        String confirmApprovalId = approvalIdOf(confirmOrder);
+        String providerTxId = paymentGateway.lookupRefund(confirmOrder, "idem-confirm-01").orElseThrow().transactionId();
 
         mockMvc.perform(post("/api/approvals/{id}/confirm-payout", confirmApprovalId)
                         .header(McpSecurityConfig.HEADER_AGENT_API_KEY, AGENT_KEY)
-                        .header(McpSecurityConfig.HEADER_REVIEWER_ID, "rogue-agent@bot.local")
+                        .header("X-Reviewer-Id", "rogue-agent@bot.local")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"transactionId\":\"tx_manual_confirm_01\"}"))
+                        .content(txBody(providerTxId)))
                 .andExpect(status().isForbidden());
 
+        // A transaction id the gateway does not know is refused and nothing is proposed
         mockMvc.perform(post("/api/approvals/{id}/confirm-payout", confirmApprovalId)
-                        .header(McpSecurityConfig.HEADER_REVIEWER_KEY, REVIEWER_KEY)
-                        .header(McpSecurityConfig.HEADER_REVIEWER_ID, REVIEWER_EMAIL)
+                        .header(HttpHeaders.AUTHORIZATION, ReviewerTokens.bearer(REVIEWER_EMAIL))
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"transactionId\":\"tx_manual_confirm_01\"}"))
+                        .content(txBody("tx_not_at_gateway")))
+                .andExpect(status().isConflict());
+
+        // The first reviewer proposes; the ledger is untouched until a second reviewer approves
+        mockMvc.perform(post("/api/approvals/{id}/confirm-payout", confirmApprovalId)
+                        .header(HttpHeaders.AUTHORIZATION, ReviewerTokens.bearer(REVIEWER_EMAIL))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(txBody(providerTxId)))
+                .andExpect(status().isAccepted())
+                .andExpect(jsonPath("$.status").value("PROPOSED"))
+                .andExpect(jsonPath("$.proposedBy").value(REVIEWER_EMAIL));
+        assertThat(refundedAmount(confirmOrder)).isEqualByComparingTo("0.00");
+
+        // Only one open proposal per payout
+        mockMvc.perform(post("/api/approvals/{id}/confirm-payout", confirmApprovalId)
+                        .header(HttpHeaders.AUTHORIZATION, ReviewerTokens.bearer(SECOND_REVIEWER))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(txBody(providerTxId)))
+                .andExpect(status().isConflict());
+
+        // The proposer cannot approve their own proposal
+        mockMvc.perform(post("/api/approvals/{id}/payout-resolution/approve", confirmApprovalId)
+                        .header(HttpHeaders.AUTHORIZATION, ReviewerTokens.bearer(REVIEWER_EMAIL)))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.error").value("SEPARATION_OF_DUTIES"));
+
+        mockMvc.perform(post("/api/approvals/{id}/payout-resolution/approve", confirmApprovalId)
+                        .header(HttpHeaders.AUTHORIZATION, ReviewerTokens.bearer(SECOND_REVIEWER)))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("EXECUTED"))
-                .andExpect(jsonPath("$.refundTxId").value("tx_manual_confirm_01"));
+                .andExpect(jsonPath("$.refundTxId").value(providerTxId));
+        assertThat(refundedAmount(confirmOrder)).isEqualByComparingTo("20.00");
+        assertThat(paymentGateway.getExecutionCountForOrder(confirmOrder)).isEqualTo(1);
 
+        // Re-proposing the recorded transaction id is idempotent; a different one is refused
         mockMvc.perform(post("/api/approvals/{id}/confirm-payout", confirmApprovalId)
-                        .header(McpSecurityConfig.HEADER_REVIEWER_KEY, REVIEWER_KEY)
-                        .header(McpSecurityConfig.HEADER_REVIEWER_ID, REVIEWER_EMAIL)
+                        .header(HttpHeaders.AUTHORIZATION, ReviewerTokens.bearer(REVIEWER_EMAIL))
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"transactionId\":\"tx_manual_confirm_01\"}"))
+                        .content(txBody(providerTxId)))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.status").value("EXECUTED"));
+                .andExpect(jsonPath("$.status").value("ALREADY_SETTLED"));
+        mockMvc.perform(post("/api/approvals/{id}/confirm-payout", confirmApprovalId)
+                        .header(HttpHeaders.AUTHORIZATION, ReviewerTokens.bearer(REVIEWER_EMAIL))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(txBody("tx_other_id")))
+                .andExpect(status().isConflict());
+        mockMvc.perform(get("/api/approvals/{id}/payout-resolutions", confirmApprovalId)
+                        .header(HttpHeaders.AUTHORIZATION, ReviewerTokens.bearer(REVIEWER_EMAIL)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].status").value("APPLIED"))
+                .andExpect(jsonPath("$[0].decidedBy").value(SECOND_REVIEWER));
 
-        assertThat(invoiceRepository.findByOrderId(confirmOrder).orElseThrow().getAlreadyRefundedAmount())
-                .isEqualByComparingTo("20.00");
-        assertThat(paymentGateway.getExecutionCountForOrder(confirmOrder)).isZero();
         ApprovalGateService.RefundDecision confirmedReplay = approvalGateService.submitRefund(
                 refund(confirmOrder, "20.00", "FEE_DIFF", "idem-confirm-01"));
         assertThat(confirmedReplay.status()).isEqualTo("EXECUTED");
-        assertThat(confirmedReplay.refundTxId()).isEqualTo("tx_manual_confirm_01");
-        assertThat(paymentGateway.getExecutionCountForOrder(confirmOrder)).isZero();
+        assertThat(confirmedReplay.refundTxId()).isEqualTo(providerTxId);
 
         jdbcTemplate.update(
                 "UPDATE idempotency_record SET state = 'COMPLETED', response_json = ? WHERE idempotency_key = ?",
@@ -728,34 +757,55 @@ class ApprovalLifecycleIT {
         ApprovalGateService.RefundDecision healed = approvalGateService.submitRefund(
                 refund(confirmOrder, "20.00", "FEE_DIFF", "idem-confirm-01"));
         assertThat(healed.status()).isEqualTo("EXECUTED");
-        assertThat(healed.refundTxId()).isEqualTo("tx_manual_confirm_01");
-        assertThat(paymentGateway.getExecutionCountForOrder(confirmOrder)).isZero();
+        assertThat(healed.refundTxId()).isEqualTo(providerTxId);
+        assertThat(paymentGateway.getExecutionCountForOrder(confirmOrder)).isEqualTo(1);
 
+        // Release path: the request never reached the provider
         String releaseOrder = "ORD-RELEASE-01";
         paymentGateway.simulateTimeoutForOrder(releaseOrder);
         assertThatThrownBy(() -> approvalGateService.submitRefund(
                 refund(releaseOrder, "20.00", "FEE_DIFF", "idem-release-01")))
                 .isInstanceOf(GuardrailExceptions.PayoutOutcomeUnknownException.class);
-        String releaseApprovalId = jdbcTemplate.queryForObject(
-                "SELECT approval_id FROM refund_approval_order WHERE order_id = ?",
-                String.class,
-                releaseOrder);
+        String releaseApprovalId = approvalIdOf(releaseOrder);
+
+        // Confirming a refund the gateway never saw is refused
+        mockMvc.perform(post("/api/approvals/{id}/confirm-payout", releaseApprovalId)
+                        .header(HttpHeaders.AUTHORIZATION, ReviewerTokens.bearer(REVIEWER_EMAIL))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(txBody("tx_made_up")))
+                .andExpect(status().isConflict());
 
         mockMvc.perform(post("/api/approvals/{id}/release-payout", releaseApprovalId)
-                        .header(McpSecurityConfig.HEADER_REVIEWER_KEY, REVIEWER_KEY)
-                        .header(McpSecurityConfig.HEADER_REVIEWER_ID, REVIEWER_EMAIL))
+                        .header(HttpHeaders.AUTHORIZATION, ReviewerTokens.bearer(REVIEWER_EMAIL)))
+                .andExpect(status().isAccepted())
+                .andExpect(jsonPath("$.action").value("RELEASE"));
+        mockMvc.perform(post("/api/approvals/{id}/payout-resolution/approve", releaseApprovalId)
+                        .header(HttpHeaders.AUTHORIZATION, ReviewerTokens.bearer(SECOND_REVIEWER)))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("PAYOUT_RELEASED"));
-        assertThat(invoiceRepository.findByOrderId(releaseOrder).orElseThrow().getAlreadyRefundedAmount())
-                .isEqualByComparingTo("0.00");
+        assertThat(refundedAmount(releaseOrder)).isEqualByComparingTo("0.00");
 
         paymentGateway.clearTimeoutForOrder(releaseOrder);
         ApprovalGateService.RefundDecision retried = approvalGateService.submitRefund(
                 refund(releaseOrder, "20.00", "FEE_DIFF", "idem-release-02"));
         assertThat(retried.status()).isEqualTo("EXECUTED");
         assertThat(paymentGateway.getExecutionCountForOrder(releaseOrder)).isEqualTo(1);
-        assertThat(invoiceRepository.findByOrderId(releaseOrder).orElseThrow().getAlreadyRefundedAmount())
-                .isEqualByComparingTo("20.00");
+        assertThat(refundedAmount(releaseOrder)).isEqualByComparingTo("20.00");
+    }
+
+    private String approvalIdOf(String orderId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT approval_id FROM refund_approval_order WHERE order_id = ? ORDER BY id LIMIT 1",
+                String.class,
+                orderId);
+    }
+
+    private BigDecimal refundedAmount(String orderId) {
+        return invoiceRepository.findByOrderId(orderId).orElseThrow().getAlreadyRefundedAmount();
+    }
+
+    private static String txBody(String transactionId) {
+        return "{\"transactionId\":\"" + transactionId + "\"}";
     }
 
     private static ApprovalGateService.RefundCommand refund(

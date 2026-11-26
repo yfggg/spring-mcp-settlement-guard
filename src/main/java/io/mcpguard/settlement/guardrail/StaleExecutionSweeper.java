@@ -52,7 +52,8 @@ public class StaleExecutionSweeper {
         int suspendedKeys = idempotencyKeyStore.suspendStaleInProgress(cutoff, now);
         Integer frozenPayouts = txTemplate.execute(status -> approvalRepository.markStaleExecutionsUnknown(cutoff));
         SweepResult result = new SweepResult(suspendedKeys, frozenPayouts == null ? 0 : frozenPayouts);
-        int redelivered = webhookNotifier.republishUnpublished();
+        int redelivered = webhookNotifier.republishUnpublished(
+                now.minus(Duration.ofSeconds(properties.recovery().outboxGraceSeconds())));
         if (result.suspendedIdempotencyKeys() > 0 || result.frozenPayouts() > 0) {
             log.warn("Froze stale in-flight requests for manual reconciliation: idempotencyKeys={}, payouts={}",
                     result.suspendedIdempotencyKeys(), result.frozenPayouts());

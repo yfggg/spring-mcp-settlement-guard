@@ -45,6 +45,20 @@ public final class GuardrailExceptions {
         }
     }
 
+    /** The same person tried to both propose and approve a payout resolution. */
+    public static class SeparationOfDutiesException extends RuntimeException {
+        public SeparationOfDutiesException(String message) {
+            super(message);
+        }
+    }
+
+    /** The gateway could not be queried, so a payout resolution cannot be verified right now. */
+    public static class GatewayVerificationUnavailableException extends RuntimeException {
+        public GatewayVerificationUnavailableException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
     /**
      * The payment gateway failed or timed out after a payout was dispatched, so money may or may not have moved.
      * The request is frozen for manual reconciliation and must never be retried automatically.

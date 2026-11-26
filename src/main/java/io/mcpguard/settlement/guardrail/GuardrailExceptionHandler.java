@@ -64,4 +64,18 @@ public class GuardrailExceptionHandler {
         return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
                 .body(Map.of("error", "PAYOUT_OUTCOME_UNKNOWN", "message", ex.getMessage()));
     }
+
+    @ExceptionHandler(GuardrailExceptions.SeparationOfDutiesException.class)
+    public ResponseEntity<Map<String, String>> handleSeparationOfDuties(GuardrailExceptions.SeparationOfDutiesException ex) {
+        return ResponseEntity.status(HttpStatus.FORBIDDEN)
+                .body(Map.of("error", "SEPARATION_OF_DUTIES", "message", ex.getMessage()));
+    }
+
+    @ExceptionHandler(GuardrailExceptions.GatewayVerificationUnavailableException.class)
+    public ResponseEntity<Map<String, String>> handleGatewayUnavailable(
+            GuardrailExceptions.GatewayVerificationUnavailableException ex) {
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                .header(HttpHeaders.RETRY_AFTER, "30")
+                .body(Map.of("error", "GATEWAY_VERIFICATION_UNAVAILABLE", "message", ex.getMessage()));
+    }
 }

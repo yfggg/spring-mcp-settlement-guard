@@ -52,6 +52,10 @@ public class IdempotencyRecord {
     @Column(name = "updated_at", nullable = false)
     private Instant updatedAt;
 
+    /** Set when this key was a retry linked to another key's in-flight approval. */
+    @Column(name = "linked_approval_id", length = 64)
+    private String linkedApprovalId;
+
     protected IdempotencyRecord() {
     }
 
@@ -77,6 +81,10 @@ public class IdempotencyRecord {
 
     public String getResponseJson() {
         return responseJson;
+    }
+
+    public String getLinkedApprovalId() {
+        return linkedApprovalId;
     }
 
     public void markCompleted(String responseJson, Instant now) {

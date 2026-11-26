@@ -15,6 +15,10 @@ import org.springframework.transaction.support.TransactionTemplate;
  * Two-step approval events. {@link #stage} joins the caller's transaction so the outbox row
  * commits together with the status change. {@link #publishStaged} runs only after that commit;
  * a crash in between leaves an unpublished row for the sweeper.
+ *
+ * <p>Delivery is at least once: the sweeper can redeliver a row whose delivery succeeded but whose
+ * {@code published_at} update did not, and several nodes can sweep at the same time. Every event carries
+ * a stable {@code eventId} so consumers can drop duplicates.
  */
 @Component
 public class ApprovalWebhookNotifier {
@@ -57,13 +61,17 @@ public class ApprovalWebhookNotifier {
         }
     }
 
-    /** Delivers rows left unpublished by a crash between commit and the listener call. */
-    public int republishUnpublished() {
-        List<ApprovalEventOutbox> pending = outboxRepository.findByPublishedAtIsNullOrderByIdAsc();
+    /** Delivers rows created before {@code cutoff} that are still unpublished. One failure does not stop the rest. */
+    public int republishUnpublished(Instant cutoff) {
+        List<ApprovalEventOutbox> pending = outboxRepository.findByPublishedAtIsNullAndCreatedAtBeforeOrderByIdAsc(cutoff);
         int delivered = 0;
         for (ApprovalEventOutbox row : pending) {
-            deliver(row.getId(), row.toEvent());
-            delivered++;
+            try {
+                deliver(row.getId(), row.toEvent());
+                delivered++;
+            } catch (RuntimeException ex) {
+                log.warn("Redelivery of approval event {} failed; it stays queued", row.getEventId(), ex);
+            }
         }
         return delivered;
     }
@@ -78,14 +86,15 @@ public class ApprovalWebhookNotifier {
 
     private void deliver(Long id, ApprovalDecisionEvent event) {
         publishedEvents.add(event);
-        log.info("Published settlement approval callback: approvalId={}, orderId={}, status={}, txId={}, reviewer={}",
-                event.approvalId(), event.orderId(), event.status(), event.refundTxId(), event.reviewerId());
+        log.info("Published settlement approval callback: eventId={}, approvalId={}, orderId={}, status={}, txId={}, reviewer={}",
+                event.eventId(), event.approvalId(), event.orderId(), event.status(), event.refundTxId(), event.reviewerId());
         if (id != null) {
             requiresNewTx.executeWithoutResult(status -> outboxRepository.markPublished(id, Instant.now()));
         }
     }
 
     public record ApprovalDecisionEvent(
+            String eventId,
             String approvalId,
             String orderId,
             BigDecimal amount,
@@ -95,5 +104,17 @@ public class ApprovalWebhookNotifier {
             String reviewerId,
             Instant decidedAt
     ) {
+        /** New event; the outbox assigns the event id when the row is staged. */
+        public ApprovalDecisionEvent(
+                String approvalId,
+                String orderId,
+                BigDecimal amount,
+                String currency,
+                ApprovalStatus status,
+                String refundTxId,
+                String reviewerId,
+                Instant decidedAt) {
+            this(null, approvalId, orderId, amount, currency, status, refundTxId, reviewerId, decidedAt);
+        }
     }
 }

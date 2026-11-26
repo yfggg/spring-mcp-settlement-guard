@@ -27,6 +27,14 @@ public interface IdempotencyRecordRepository extends JpaRepository<IdempotencyRe
             """)
     int deleteSuspended(@Param("idempotencyKey") String idempotencyKey);
 
+    @Modifying(flushAutomatically = true)
+    @Query("""
+            UPDATE IdempotencyRecord r
+               SET r.linkedApprovalId = :approvalId
+             WHERE r.idempotencyKey = :idempotencyKey
+            """)
+    int linkApproval(@Param("idempotencyKey") String idempotencyKey, @Param("approvalId") String approvalId);
+
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("""
             UPDATE IdempotencyRecord r

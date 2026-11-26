@@ -107,6 +107,15 @@ public class IdempotencyKeyStore {
         return deleted != null && deleted == 1;
     }
 
+    /** Records, in the caller's transaction, that this key is a retry of another key's in-flight approval. */
+    public void linkToApproval(String idempotencyKey, String approvalId) {
+        repository.linkApproval(idempotencyKey, approvalId);
+    }
+
+    public Optional<String> linkedApprovalId(String idempotencyKey) {
+        return repository.findByIdempotencyKey(idempotencyKey).map(IdempotencyRecord::getLinkedApprovalId);
+    }
+
     /** Freezes keys whose owning request never finished (for example after a process crash). */
     public int suspendStaleInProgress(Instant cutoff, Instant now) {
         Integer updated = requiresNewTx.execute(status -> repository.suspendStaleInProgress(

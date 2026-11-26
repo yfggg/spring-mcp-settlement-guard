@@ -9,7 +9,8 @@ import org.springframework.data.repository.query.Param;
 
 public interface ApprovalEventOutboxRepository extends JpaRepository<ApprovalEventOutbox, Long> {
 
-    List<ApprovalEventOutbox> findByPublishedAtIsNullOrderByIdAsc();
+    /** Rows still unpublished after the grace period, so a request thread mid-delivery is not raced. */
+    List<ApprovalEventOutbox> findByPublishedAtIsNullAndCreatedAtBeforeOrderByIdAsc(Instant cutoff);
 
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("""

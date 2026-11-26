@@ -20,11 +20,12 @@ guardrail:
     approval-ttl-hours: 24
   security:
     agent-api-key: test-agent-key
-    reviewer-api-key: test-reviewer-key
+    reviewer-jwt-secret: test-reviewer-jwt-secret-0123456789abcdef
     snapshot-hmac-key: test-snapshot-hmac
   recovery:
     stale-after-minutes: 15
     sweep-interval-ms: 3600000
+    outbox-grace-seconds: 30
   demo:
     seed-enabled: true
     http-enabled: true
